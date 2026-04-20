@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: promo-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python run_promo_bot.py
+    autoDeploy: true
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: BASE_URL
+        sync: false
+      - key: WEB_HOST
+        value: 0.0.0.0
+      - key: WEB_PORT
+        value: 10000
+      - key: TRUST_X_FORWARDED_FOR
+        value: "true"
