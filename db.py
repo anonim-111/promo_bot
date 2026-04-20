@@ -25,7 +25,17 @@ def _mongo_uri() -> str:
 def _get_client() -> AsyncIOMotorClient:
     global _client
     if _client is None:
-        _client = AsyncIOMotorClient(_mongo_uri())
+        import ssl
+
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        _client = AsyncIOMotorClient(
+            _mongo_uri(),
+            tls=True,
+            tlsAllowInvalidCertificates=True,
+            tlsContext=ssl_context,
+        )
     return _client
 
 
