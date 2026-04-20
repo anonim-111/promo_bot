@@ -5,14 +5,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from motor.motor_asyncio import AsyncIOMotorClient
+import certifi
 from pymongo import ReturnDocument
+from pymongo.asynchronous.mongo_client import AsyncMongoClient
 from pymongo.errors import DuplicateKeyError
 
 DB_PATH = Path(__file__).resolve().parent / "data" / "promo.db"
 DB_NAME = "promo_db"
 
-_client: AsyncIOMotorClient | None = None
+_client: AsyncMongoClient | None = None
 
 
 def _mongo_uri() -> str:
@@ -22,19 +23,12 @@ def _mongo_uri() -> str:
     return uri
 
 
-def _get_client() -> AsyncIOMotorClient:
+def _get_client() -> AsyncMongoClient:
     global _client
     if _client is None:
-        import certifi
-
-        # Atlas (mongodb+srv) + Render / Python 3.12+ OpenSSL: ba'zan qattiq TLS tekshiruvi
-        # TLSV1_ALERT_INTERNAL_ERROR beradi. certifi CA + yumshoq TLS (faqat ulanish uchun).
-        # tlsInsecure va tlsAllowInvalidCertificates bir vaqtda berilmasin (InvalidURI).
-        _client = AsyncIOMotorClient(
+        _client = AsyncMongoClient(
             _mongo_uri(),
-            tls=True,
             tlsCAFile=certifi.where(),
-            tlsAllowInvalidCertificates=True,
         )
     return _client
 
@@ -144,10 +138,6 @@ async def update_link_fields(
     url: str | None = None,
     title: Any = _UNSET,
 ) -> bool:
-    """
-    Faqat berilgan maydonlarni yangilaydi.
-    title=... berilsa (bo'sh qator ham) sarlavha yangilanadi; title o'tkazilmasa — o'zgarmaydi.
-    """
     row = await get_link(link_id)
     if not row:
         return False
@@ -163,7 +153,6 @@ async def update_link_fields(
 
 
 async def delete_link(link_id: int) -> bool:
-    """Link, tracking yozuvlari (CASCADE) va logo fayllarini o'chiradi."""
     row = await get_link(link_id)
     if not row:
         return False
@@ -224,7 +213,6 @@ async def get_track_token(link_id: int, promo_id: int) -> str | None:
 
 
 async def create_track_entry(link_id: int, promo_id: int) -> str:
-    """Returns unique tracking token (existing pair returns same token)."""
     existing = await get_track_token(link_id, promo_id)
     if existing:
         return existing
@@ -268,7 +256,6 @@ async def increment_click(token: str) -> None:
 
 
 async def stats_summary() -> list[dict[str, Any]]:
-    """Har bir link × promo juftligi: QR bo'lmasa ham 0 yuklanish bilan chiqadi."""
     links = await list_links()
     promos = await list_promos()
     links_sorted = sorted(links, key=lambda r: r["url"])
@@ -294,7 +281,6 @@ async def stats_summary() -> list[dict[str, Any]]:
 
 
 async def stats_for_link(link_id: int) -> list[dict[str, Any]]:
-    """Bitta link uchun: har bir promo va yuklanishlar (track bo'lmasa 0)."""
     promos = await list_promos()
     promos_sorted = sorted(promos, key=lambda r: str(r["code"]).lower())
 
