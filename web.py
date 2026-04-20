@@ -4,6 +4,11 @@ from yarl import URL
 from security_web import SlidingWindowRateLimiter, is_valid_track_token, rate_limit_middleware
 
 
+async def health(request: web.Request) -> web.StreamResponse:
+    """Render health check — /r/ kabi DB yuklamasiz."""
+    return web.Response(text="OK")
+
+
 async def redirect_handler(request: web.Request) -> web.StreamResponse:
     import db
 
@@ -26,5 +31,6 @@ def create_app() -> web.Application:
         max_requests=RATE_LIMIT_REQUESTS,
         window_seconds=RATE_LIMIT_WINDOW_SEC,
     )
+    app.router.add_get("/health", health)
     app.router.add_get("/r/{token}", redirect_handler)
     return app

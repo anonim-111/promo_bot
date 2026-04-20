@@ -35,7 +35,23 @@ async def main() -> None:
 
     bot = make_bot()
     dp = get_dispatcher()
-    await dp.start_polling(bot)
+    try:
+        # Webhook + navbatdagi yangilanishlarni tozalash (deployda ikki instance oralig'i).
+        # Eslatma: aiogram 3 start_polling() da drop_pending_updates yo'q — Telegram tozalashi
+        # shu delete_webhook chaqiruvi orqali.
+        await bot.delete_webhook(drop_pending_updates=True)
+        await dp.start_polling(bot, handle_signals=True)
+    finally:
+        # SIGTERM / polling tugagach — port va sessiyalarni yopish (Renderda eski pod tez "bo'shashi").
+        try:
+            await site.stop()
+        except Exception:
+            logging.exception("site.stop() xatosi")
+        try:
+            await runner.cleanup()
+        except Exception:
+            logging.exception("runner.cleanup() xatosi")
+        logging.info("Kuzatuv serveri va bot sessiyasi yopildi.")
 
 
 if __name__ == "__main__":
