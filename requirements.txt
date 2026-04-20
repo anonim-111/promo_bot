@@ -5,3 +5,4 @@ pymongo[srv]==4.7.3
 qrcode[pil]>=7.4
 python-dotenv>=1.0
 Pillow>=10.0
+certifi
