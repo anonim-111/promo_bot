@@ -29,12 +29,12 @@ def _get_client() -> AsyncIOMotorClient:
 
         # Atlas (mongodb+srv) + Render / Python 3.12+ OpenSSL: ba'zan qattiq TLS tekshiruvi
         # TLSV1_ALERT_INTERNAL_ERROR beradi. certifi CA + yumshoq TLS (faqat ulanish uchun).
+        # tlsInsecure va tlsAllowInvalidCertificates bir vaqtda berilmasin (InvalidURI).
         _client = AsyncIOMotorClient(
             _mongo_uri(),
             tls=True,
             tlsCAFile=certifi.where(),
             tlsAllowInvalidCertificates=True,
-            tlsInsecure=True,
         )
     return _client
 
