@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-import os
 import sys
 
 from aiohttp import web
@@ -11,9 +10,6 @@ import db
 from bot import get_dispatcher, make_bot
 from config import ADMIN_IDS, BOT_TOKEN, WEB_HOST, WEB_PORT
 from web import create_app
-
-# Render da bir nechta pod bo'lsa — faqat bittasi polling qilsin
-_POLLING_LOCK_ENV = "RENDER_INSTANCE_ID"
 
 
 async def main() -> None:
@@ -32,9 +28,7 @@ async def main() -> None:
             "Telegram ID ni .env ga qo'shing."
         )
 
-    await db.init_db()
-
-    # ── Web server (barcha podlarda ishga tushadi) ──
+    # ── Avval web server ishga tushadi (Render port ko'rsin) ──
     app = create_app()
     runner = web.AppRunner(app)
     await runner.setup()
@@ -42,23 +36,8 @@ async def main() -> None:
     await site.start()
     logging.info("Kuzatuv serveri: http://%s:%s/r/<token>", WEB_HOST, WEB_PORT)
 
-    # ── Polling faqat bitta podda ishlashi ──
-    instance_id = os.getenv(_POLLING_LOCK_ENV, "")
-    if instance_id:
-        # Render har bir podga RENDER_INSTANCE_ID beradi
-        # Faqat birinchi pod (0) polling qilsin
-        if not instance_id.endswith("0"):
-            logging.info(
-                "Bu pod (%s) polling qilmaydi — faqat web server ishlaydi.",
-                instance_id,
-            )
-            # Chiqmasdan web serverni ushlab turadi
-            try:
-                await asyncio.Event().wait()
-            finally:
-                await site.stop()
-                await runner.cleanup()
-            return
+    # ── Keyin DB ulanadi ──
+    await db.init_db()
 
     bot = make_bot()
     dp = get_dispatcher()
