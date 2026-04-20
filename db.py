@@ -1,67 +1,101 @@
+import os
 import secrets
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import aiosqlite
+from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo import ReturnDocument
+from pymongo.errors import DuplicateKeyError
 
 DB_PATH = Path(__file__).resolve().parent / "data" / "promo.db"
+DB_NAME = "promo_db"
+
+_client: AsyncIOMotorClient | None = None
+
+
+def _mongo_uri() -> str:
+    uri = os.getenv("MONGODB_URI", "").strip()
+    if not uri:
+        raise RuntimeError("MONGODB_URI environment variable is required")
+    return uri
+
+
+def _get_client() -> AsyncIOMotorClient:
+    global _client
+    if _client is None:
+        _client = AsyncIOMotorClient(_mongo_uri())
+    return _client
+
+
+def _db() -> Any:
+    return _get_client()[DB_NAME]
+
+
+def _links() -> Any:
+    return _db()["links"]
+
+
+def _promos() -> Any:
+    return _db()["promos"]
+
+
+def _tracks() -> Any:
+    return _db()["track_entries"]
+
+
+def _counters() -> Any:
+    return _db()["counters"]
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+async def _next_seq(counter_key: str) -> int:
+    doc = await _counters().find_one_and_update(
+        {"_id": counter_key},
+        {"$inc": {"seq": 1}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    return int(doc["seq"])
+
+
+def _link_to_dict(doc: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not doc:
+        return None
+    return {
+        "id": int(doc["_id"]),
+        "url": doc["url"],
+        "title": doc.get("title"),
+        "created_at": doc["created_at"],
+        "logo_path": doc.get("logo_path"),
+    }
+
+
+def _promo_to_dict(doc: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": int(doc["_id"]),
+        "code": doc["code"],
+        "created_at": doc["created_at"],
+    }
+
+
 async def init_db() -> None:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        await db.executescript(
-            """
-            PRAGMA foreign_keys = ON;
-            PRAGMA busy_timeout = 5000;
-
-            CREATE TABLE IF NOT EXISTS links (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                url TEXT NOT NULL,
-                title TEXT,
-                created_at TEXT NOT NULL,
-                logo_path TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS promos (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                code TEXT NOT NULL UNIQUE,
-                created_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS track_entries (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                link_id INTEGER NOT NULL,
-                promo_id INTEGER NOT NULL,
-                token TEXT NOT NULL UNIQUE,
-                clicks INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL,
-                UNIQUE(link_id, promo_id),
-                FOREIGN KEY (link_id) REFERENCES links(id) ON DELETE CASCADE,
-                FOREIGN KEY (promo_id) REFERENCES promos(id) ON DELETE CASCADE
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_track_token ON track_entries(token);
-            """
-        )
-        await db.commit()
+    await _promos().create_index("code", unique=True)
+    await _tracks().create_index("token", unique=True)
+    await _tracks().create_index([("link_id", 1), ("promo_id", 1)], unique=True)
     await _migrate_schema()
 
 
 async def _migrate_schema() -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("PRAGMA table_info(links)")
-        cols = {row[1] for row in await cur.fetchall()}
-        if "logo_path" not in cols:
-            await db.execute("ALTER TABLE links ADD COLUMN logo_path TEXT")
-            await db.commit()
+    await _links().update_many(
+        {"logo_path": {"$exists": False}},
+        {"$set": {"logo_path": None}},
+    )
 
 
 def disk_path_for_link_logo(link_id: int) -> Path:
@@ -70,32 +104,25 @@ def disk_path_for_link_logo(link_id: int) -> Path:
 
 
 async def add_link(url: str, title: str | None = None) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "INSERT INTO links (url, title, created_at, logo_path) VALUES (?, ?, ?, NULL)",
-            (url.strip(), (title or "").strip() or None, _now()),
-        )
-        await db.commit()
-        return int(cur.lastrowid)
+    lid = await _next_seq("links")
+    doc = {
+        "_id": lid,
+        "url": url.strip(),
+        "title": (title or "").strip() or None,
+        "created_at": _now(),
+        "logo_path": None,
+    }
+    await _links().insert_one(doc)
+    return lid
 
 
 async def get_link(link_id: int) -> dict[str, Any] | None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            "SELECT id, url, title, created_at, logo_path FROM links WHERE id = ?",
-            (link_id,),
-        )
-        row = await cur.fetchone()
-        return dict(row) if row else None
+    doc = await _links().find_one({"_id": link_id})
+    return _link_to_dict(doc)
 
 
 async def set_link_logo_path(link_id: int, path: str | None) -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE links SET logo_path = ? WHERE id = ?", (path, link_id)
-        )
-        await db.commit()
+    await _links().update_one({"_id": link_id}, {"$set": {"logo_path": path}})
 
 
 _UNSET = object()
@@ -114,24 +141,15 @@ async def update_link_fields(
     row = await get_link(link_id)
     if not row:
         return False
-    sets: list[str] = []
-    vals: list[object] = []
+    update: dict[str, Any] = {}
     if url is not None:
-        sets.append("url = ?")
-        vals.append(url.strip())
+        update["url"] = url.strip()
     if title is not _UNSET:
-        sets.append("title = ?")
-        vals.append((str(title).strip() or None) if title is not None else None)
-    if not sets:
+        update["title"] = (str(title).strip() or None) if title is not None else None
+    if not update:
         return True
-    vals.append(link_id)
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            f"UPDATE links SET {', '.join(sets)} WHERE id = ?",
-            vals,
-        )
-        await db.commit()
-    return True
+    res = await _links().update_one({"_id": link_id}, {"$set": update})
+    return res.matched_count > 0
 
 
 async def delete_link(link_id: int) -> bool:
@@ -143,58 +161,56 @@ async def delete_link(link_id: int) -> bool:
     if lp:
         Path(lp).unlink(missing_ok=True)
     disk_path_for_link_logo(link_id).unlink(missing_ok=True)
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM links WHERE id = ?", (link_id,))
-        await db.commit()
+    await _tracks().delete_many({"link_id": link_id})
+    await _links().delete_one({"_id": link_id})
     return True
 
 
 async def add_promo(code: str) -> int:
     code = code.strip()
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "INSERT INTO promos (code, created_at) VALUES (?, ?)",
-            (code, _now()),
-        )
-        await db.commit()
-        return int(cur.lastrowid)
+    pid = await _next_seq("promos")
+    doc = {"_id": pid, "code": code, "created_at": _now()}
+    try:
+        await _promos().insert_one(doc)
+    except DuplicateKeyError as e:
+        await _counters().update_one({"_id": "promos"}, {"$inc": {"seq": -1}})
+        raise sqlite3.IntegrityError("duplicate promo code") from e
+    return pid
 
 
 async def list_links() -> list[dict[str, Any]]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            "SELECT id, url, title, created_at, logo_path FROM links ORDER BY id DESC"
-        )
-        rows = await cur.fetchall()
-        return [dict(r) for r in rows]
+    cursor = _links().find().sort("_id", -1)
+    out: list[dict[str, Any]] = []
+    async for doc in cursor:
+        d = _link_to_dict(doc)
+        if d:
+            out.append(d)
+    return out
 
 
 async def list_promos() -> list[dict[str, Any]]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            "SELECT id, code, created_at FROM promos ORDER BY id DESC"
-        )
-        rows = await cur.fetchall()
-        return [dict(r) for r in rows]
+    cursor = _promos().find().sort("_id", -1)
+    out: list[dict[str, Any]] = []
+    async for doc in cursor:
+        out.append(_promo_to_dict(doc))
+    return out
 
 
 async def get_promo_code_by_id(promo_id: int) -> str | None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT code FROM promos WHERE id = ?", (promo_id,))
-        row = await cur.fetchone()
-        return row[0] if row else None
+    doc = await _promos().find_one({"_id": promo_id}, projection={"code": 1})
+    if not doc:
+        return None
+    return str(doc["code"])
 
 
 async def get_track_token(link_id: int, promo_id: int) -> str | None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "SELECT token FROM track_entries WHERE link_id = ? AND promo_id = ?",
-            (link_id, promo_id),
-        )
-        row = await cur.fetchone()
-        return row[0] if row else None
+    doc = await _tracks().find_one(
+        {"link_id": link_id, "promo_id": promo_id},
+        projection={"token": 1},
+    )
+    if not doc:
+        return None
+    return str(doc["token"])
 
 
 async def create_track_entry(link_id: int, promo_id: int) -> str:
@@ -204,18 +220,22 @@ async def create_track_entry(link_id: int, promo_id: int) -> str:
         return existing
     for _ in range(4):
         token = secrets.token_urlsafe(16).rstrip("=").replace("-", "_")
+        tid = await _next_seq("track_entries")
+        doc = {
+            "_id": tid,
+            "link_id": link_id,
+            "promo_id": promo_id,
+            "token": token,
+            "clicks": 0,
+            "created_at": _now(),
+        }
         try:
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute(
-                    """
-                    INSERT INTO track_entries (link_id, promo_id, token, clicks, created_at)
-                    VALUES (?, ?, ?, 0, ?)
-                    """,
-                    (link_id, promo_id, token, _now()),
-                )
-                await db.commit()
+            await _tracks().insert_one(doc)
             return token
-        except sqlite3.IntegrityError:
+        except DuplicateKeyError:
+            await _counters().update_one(
+                {"_id": "track_entries"}, {"$inc": {"seq": -1}}
+            )
             again = await get_track_token(link_id, promo_id)
             if again:
                 return again
@@ -224,58 +244,60 @@ async def create_track_entry(link_id: int, promo_id: int) -> str:
 
 
 async def get_link_url_by_token(token: str) -> str | None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "SELECT l.url FROM track_entries t JOIN links l ON l.id = t.link_id WHERE t.token = ?",
-            (token,),
-        )
-        row = await cur.fetchone()
-        return row[0] if row else None
+    tdoc = await _tracks().find_one({"token": token}, projection={"link_id": 1})
+    if not tdoc:
+        return None
+    link = await _links().find_one({"_id": tdoc["link_id"]}, projection={"url": 1})
+    if not link:
+        return None
+    return str(link["url"])
 
 
 async def increment_click(token: str) -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE track_entries SET clicks = clicks + 1 WHERE token = ?", (token,)
-        )
-        await db.commit()
+    await _tracks().update_one({"token": token}, {"$inc": {"clicks": 1}})
 
 
 async def stats_summary() -> list[dict[str, Any]]:
     """Har bir link × promo juftligi: QR bo'lmasa ham 0 yuklanish bilan chiqadi."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            """
-            SELECT l.url AS link_url,
-                   l.title AS link_title,
-                   p.code AS promo_code,
-                   COALESCE(t.clicks, 0) AS clicks
-            FROM links l
-            CROSS JOIN promos p
-            LEFT JOIN track_entries t
-              ON t.link_id = l.id AND t.promo_id = p.id
-            ORDER BY p.code COLLATE NOCASE ASC, l.url ASC
-            """
-        )
-        rows = await cur.fetchall()
-        return [dict(r) for r in rows]
+    links = await list_links()
+    promos = await list_promos()
+    links_sorted = sorted(links, key=lambda r: r["url"])
+    promos_sorted = sorted(promos, key=lambda r: str(r["code"]).lower())
+
+    track_map: dict[tuple[int, int], int] = {}
+    async for t in _tracks().find():
+        track_map[(int(t["link_id"]), int(t["promo_id"]))] = int(t.get("clicks") or 0)
+
+    rows: list[dict[str, Any]] = []
+    for p in promos_sorted:
+        for l in links_sorted:
+            clicks = track_map.get((int(l["id"]), int(p["id"])), 0)
+            rows.append(
+                {
+                    "link_url": l["url"],
+                    "link_title": l.get("title"),
+                    "promo_code": p["code"],
+                    "clicks": clicks,
+                }
+            )
+    return rows
 
 
 async def stats_for_link(link_id: int) -> list[dict[str, Any]]:
     """Bitta link uchun: har bir promo va yuklanishlar (track bo'lmasa 0)."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            """
-            SELECT p.code AS promo_code,
-                   COALESCE(t.clicks, 0) AS clicks
-            FROM promos p
-            LEFT JOIN track_entries t
-              ON t.promo_id = p.id AND t.link_id = ?
-            ORDER BY p.code COLLATE NOCASE ASC
-            """,
-            (link_id,),
+    promos = await list_promos()
+    promos_sorted = sorted(promos, key=lambda r: str(r["code"]).lower())
+
+    track_map: dict[int, int] = {}
+    async for t in _tracks().find({"link_id": link_id}):
+        track_map[int(t["promo_id"])] = int(t.get("clicks") or 0)
+
+    rows: list[dict[str, Any]] = []
+    for p in promos_sorted:
+        rows.append(
+            {
+                "promo_code": p["code"],
+                "clicks": track_map.get(int(p["id"]), 0),
+            }
         )
-        rows = await cur.fetchall()
-        return [dict(r) for r in rows]
+    return rows
