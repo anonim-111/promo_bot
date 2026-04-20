@@ -26,9 +26,15 @@ def _get_client() -> AsyncIOMotorClient:
     global _client
     if _client is None:
         import certifi
+
+        # Atlas (mongodb+srv) + Render / Python 3.12+ OpenSSL: ba'zan qattiq TLS tekshiruvi
+        # TLSV1_ALERT_INTERNAL_ERROR beradi. certifi CA + yumshoq TLS (faqat ulanish uchun).
         _client = AsyncIOMotorClient(
             _mongo_uri(),
+            tls=True,
             tlsCAFile=certifi.where(),
+            tlsAllowInvalidCertificates=True,
+            tlsInsecure=True,
         )
     return _client
 
