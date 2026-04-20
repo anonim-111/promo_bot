@@ -12,7 +12,7 @@ from qrcode.image.styledpil import StyledPilImage
 from qrcode.image.styles.colormasks import RadialGradiantColorMask, SolidFillColorMask
 from qrcode.image.styles.moduledrawers import RoundedModuleDrawer, SquareModuleDrawer
 
-from promo_bot.config import (
+from config import (
     QR_BACKGROUND_RGB,
     QR_BORDER,
     QR_BOX_SIZE,

@@ -22,10 +22,10 @@ from aiogram.types import (
     ReplyKeyboardRemove,
 )
 
-from promo_bot import db
-from promo_bot.config import BASE_URL, BOT_TOKEN, TELEGRAM_HTTP_TIMEOUT, is_admin
-from promo_bot.link_logo import download_and_save_link_logo
-from promo_bot.qr_image import render_tracking_qr_png
+import db
+from config import BASE_URL, BOT_TOKEN, TELEGRAM_HTTP_TIMEOUT, is_admin
+from link_logo import download_and_save_link_logo
+from qr_image import render_tracking_qr_png
 
 router = Router()
 

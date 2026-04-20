@@ -7,7 +7,7 @@ from io import BytesIO
 from aiogram.types import Message
 from PIL import Image
 
-from promo_bot import db
+import db
 
 _ALLOWED_DOC = frozenset({"image/png", "image/jpeg", "image/webp"})
 

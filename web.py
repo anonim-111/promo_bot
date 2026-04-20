@@ -1,11 +1,11 @@
 from aiohttp import web
 from yarl import URL
 
-from promo_bot.security_web import SlidingWindowRateLimiter, is_valid_track_token, rate_limit_middleware
+from security_web import SlidingWindowRateLimiter, is_valid_track_token, rate_limit_middleware
 
 
 async def redirect_handler(request: web.Request) -> web.StreamResponse:
-    from promo_bot import db
+    import db
 
     token = request.match_info.get("token", "")
     if not is_valid_track_token(token):
@@ -19,7 +19,7 @@ async def redirect_handler(request: web.Request) -> web.StreamResponse:
 
 
 def create_app() -> web.Application:
-    from promo_bot.config import RATE_LIMIT_REQUESTS, RATE_LIMIT_WINDOW_SEC
+    from config import RATE_LIMIT_REQUESTS, RATE_LIMIT_WINDOW_SEC
 
     app = web.Application(middlewares=[rate_limit_middleware])
     app["rate_limiter"] = SlidingWindowRateLimiter(

@@ -14,7 +14,7 @@ from collections import defaultdict
 
 from aiohttp import web
 
-from promo_bot.config import (
+from config import (
     RATE_LIMIT_ENABLED,
     RATE_LIMIT_REQUESTS,
     RATE_LIMIT_WINDOW_SEC,

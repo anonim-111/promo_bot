@@ -6,10 +6,10 @@ import sys
 
 from aiohttp import web
 
-from promo_bot import db
-from promo_bot.bot import get_dispatcher, make_bot
-from promo_bot.config import ADMIN_IDS, BOT_TOKEN, WEB_HOST, WEB_PORT
-from promo_bot.web import create_app
+import db
+from bot import get_dispatcher, make_bot
+from config import ADMIN_IDS, BOT_TOKEN, WEB_HOST, WEB_PORT
+from web import create_app
 
 
 async def main() -> None:
