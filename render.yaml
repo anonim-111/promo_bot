@@ -19,3 +19,5 @@ services:
         value: 10000
       - key: TRUST_X_FORWARDED_FOR
         value: "true"
+      - key: PYTHON_VERSION
+        value: 3.11.9
