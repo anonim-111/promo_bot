@@ -7,6 +7,8 @@ services:
     startCommand: python run_promo_bot.py
     autoDeploy: true
     envVars:
+      - key: DATABASE_URL
+        sync: false
       - key: BOT_TOKEN
         sync: false
       - key: ADMIN_IDS
@@ -16,6 +18,8 @@ services:
       - key: WEB_HOST
         value: 0.0.0.0
       - key: WEB_PORT
+        value: 10000
+      - key: PORT
         value: 10000
       - key: TRUST_X_FORWARDED_FOR
         value: "true"

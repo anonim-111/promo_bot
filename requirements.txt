@@ -1,7 +1,6 @@
 aiogram>=3.4,<4
 aiohttp>=3.9
-pymongo[srv]>=4.9
-certifi
+asyncpg>=0.29
 qrcode[pil]>=7.4
 python-dotenv>=1.0
 Pillow>=10.0

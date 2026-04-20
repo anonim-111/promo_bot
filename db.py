@@ -1,132 +1,219 @@
 import os
 import secrets
+import socket
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
-import certifi
-from pymongo import ReturnDocument
-from pymongo.asynchronous.mongo_client import AsyncMongoClient
-from pymongo.errors import DuplicateKeyError
+import asyncpg
+from asyncpg.exceptions import UniqueViolationError
 
-DB_PATH = Path(__file__).resolve().parent / "data" / "promo.db"
-DB_NAME = "promo_db"
+DATA_DIR = Path(__file__).resolve().parent / "data"
+# Eski kod bilan mos: logo yo‘li `data/logos/` (promo.db fayli endi ishlatilmaydi).
+DB_PATH = DATA_DIR / "promo.db"
 
-_client: AsyncMongoClient | None = None
-
-
-def _mongo_uri() -> str:
-    uri = os.getenv("MONGODB_URI", "").strip()
-    if not uri:
-        raise RuntimeError("MONGODB_URI environment variable is required")
-    return uri
+_pool: asyncpg.Pool | None = None
 
 
-def _get_client() -> AsyncMongoClient:
-    global _client
-    if _client is None:
-        _client = AsyncMongoClient(
-            _mongo_uri(),
-            tlsCAFile=certifi.where(),
-        )
-    return _client
-
-
-def _db() -> Any:
-    return _get_client()[DB_NAME]
-
-
-def _links() -> Any:
-    return _db()["links"]
-
-
-def _promos() -> Any:
-    return _db()["promos"]
-
-
-def _tracks() -> Any:
-    return _db()["track_entries"]
-
-
-def _counters() -> Any:
-    return _db()["counters"]
-
-
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-async def _next_seq(counter_key: str) -> int:
-    doc = await _counters().find_one_and_update(
-        {"_id": counter_key},
-        {"$inc": {"seq": 1}},
-        upsert=True,
-        return_document=ReturnDocument.AFTER,
+def _dsn() -> str:
+    dsn = (
+        os.getenv("DATABASE_URL", "").strip()
+        or os.getenv("SUPABASE_DATABASE_URL", "").strip()
     )
-    return int(doc["seq"])
+    if not dsn:
+        raise RuntimeError(
+            "DATABASE_URL yoki SUPABASE_DATABASE_URL kerak (Supabase PostgreSQL), "
+            "yoki SUPABASE_DB_HOST + SUPABASE_DB_PASSWORD"
+        )
+    # .env da qo'shtirnoq bilan yozilsa
+    if len(dsn) >= 2 and dsn[0] == dsn[-1] and dsn[0] in "\"'":
+        dsn = dsn[1:-1].strip()
+    if dsn.startswith("http://") or dsn.startswith("https://"):
+        raise RuntimeError(
+            "DATABASE_URL noto'g'ri: https:// (Next.js API URL) emas, "
+            "postgresql://... kerak — Supabase → Database → Connection string."
+        )
+    if dsn.startswith("postgres://"):
+        dsn = "postgresql://" + dsn[len("postgres://") :]
+    parsed = urlparse(dsn)
+    if not parsed.hostname:
+        raise RuntimeError(
+            "DATABASE_URL noto'g'ri: host (masalan db.xxxxx.supabase.co) ko'rinmayapti. "
+            "Parolda @ # : $ kabi belgilar bo'lsa, SUPABASE_DB_HOST + SUPABASE_DB_PASSWORD "
+            "islang yoki parolni URL-encode qiling."
+        )
+    return dsn
 
 
-def _link_to_dict(doc: dict[str, Any] | None) -> dict[str, Any] | None:
-    if not doc:
-        return None
-    return {
-        "id": int(doc["_id"]),
-        "url": doc["url"],
-        "title": doc.get("title"),
-        "created_at": doc["created_at"],
-        "logo_path": doc.get("logo_path"),
-    }
+def _pg_password_explicit() -> str | None:
+    return (
+        os.getenv("SUPABASE_DB_PASSWORD", "").strip()
+        or os.getenv("PGPASSWORD", "").strip()
+        or None
+    )
 
 
-def _promo_to_dict(doc: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "id": int(doc["_id"]),
-        "code": doc["code"],
-        "created_at": doc["created_at"],
-    }
+def _use_explicit_pg_params() -> bool:
+    """URI parse muammosiz: maxsus belgili parollar uchun."""
+    return bool(os.getenv("SUPABASE_DB_HOST", "").strip()) and bool(_pg_password_explicit())
+
+
+async def _create_pool() -> asyncpg.Pool:
+    if _use_explicit_pg_params():
+        host = os.getenv("SUPABASE_DB_HOST", "").strip()
+        password = _pg_password_explicit()
+        assert password is not None
+        user = os.getenv("SUPABASE_DB_USER", "postgres").strip()
+        port = int(os.getenv("SUPABASE_DB_PORT", "5432"))
+        database = os.getenv("SUPABASE_DB_NAME", "postgres").strip()
+        try:
+            return await asyncpg.create_pool(
+                host=host,
+                port=port,
+                user=user,
+                password=password,
+                database=database,
+                min_size=1,
+                max_size=10,
+                statement_cache_size=0,
+                ssl=True,
+            )
+        except socket.gaierror as e:
+            raise RuntimeError(
+                f"DNS: host {host!r} topilmadi. Supabase → Database → "
+                f"Host ni tekshiring (odatda db.xxxxx.supabase.co, port 5432 yoki pooler 6543)."
+            ) from e
+    dsn = _dsn()
+    parsed = urlparse(dsn)
+    try:
+        return await asyncpg.create_pool(
+            dsn,
+            min_size=1,
+            max_size=10,
+            statement_cache_size=0,
+        )
+    except socket.gaierror as e:
+        raise RuntimeError(
+            f"DNS: URI dagi host {parsed.hostname!r} topilmadi. "
+            "A) Internet/VPN; B) Supabase URI ni qayta nusxalang; "
+            "C) Parolda $ & bo'lsa .env da SUPABASE_DB_HOST + SUPABASE_DB_PASSWORD ishlating."
+        ) from e
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _row(r: asyncpg.Record) -> dict[str, Any]:
+    d: dict[str, Any] = {}
+    for k in r.keys():
+        v = r[k]
+        if isinstance(v, datetime):
+            d[k] = v.isoformat()
+        else:
+            d[k] = v
+    return d
 
 
 async def init_db() -> None:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    await _promos().create_index("code", unique=True)
-    await _tracks().create_index("token", unique=True)
-    await _tracks().create_index([("link_id", 1), ("promo_id", 1)], unique=True)
+    global _pool
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if _pool is None:
+        _pool = await _create_pool()
+    assert _pool is not None
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS links (
+                id BIGSERIAL PRIMARY KEY,
+                url TEXT NOT NULL,
+                title TEXT,
+                created_at TIMESTAMPTZ NOT NULL,
+                logo_path TEXT
+            );
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS promos (
+                id BIGSERIAL PRIMARY KEY,
+                code TEXT NOT NULL UNIQUE,
+                created_at TIMESTAMPTZ NOT NULL
+            );
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS track_entries (
+                id BIGSERIAL PRIMARY KEY,
+                link_id BIGINT NOT NULL REFERENCES links(id) ON DELETE CASCADE,
+                promo_id BIGINT NOT NULL REFERENCES promos(id) ON DELETE CASCADE,
+                token TEXT NOT NULL UNIQUE,
+                clicks BIGINT NOT NULL DEFAULT 0,
+                created_at TIMESTAMPTZ NOT NULL,
+                UNIQUE(link_id, promo_id)
+            );
+            """
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_track_token ON track_entries(token);"
+        )
     await _migrate_schema()
 
 
 async def _migrate_schema() -> None:
-    await _links().update_many(
-        {"logo_path": {"$exists": False}},
-        {"$set": {"logo_path": None}},
-    )
+    assert _pool is not None
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "ALTER TABLE links ADD COLUMN IF NOT EXISTS logo_path TEXT;"
+        )
 
 
 def disk_path_for_link_logo(link_id: int) -> Path:
     """QR markazidagi logo fayli (PNG)."""
-    return DB_PATH.parent / "logos" / f"link_{link_id}.png"
+    return DATA_DIR / "logos" / f"link_{link_id}.png"
 
 
 async def add_link(url: str, title: str | None = None) -> int:
-    lid = await _next_seq("links")
-    doc = {
-        "_id": lid,
-        "url": url.strip(),
-        "title": (title or "").strip() or None,
-        "created_at": _now(),
-        "logo_path": None,
-    }
-    await _links().insert_one(doc)
-    return lid
+    assert _pool is not None
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO links (url, title, created_at, logo_path)
+            VALUES ($1, $2, $3, NULL)
+            RETURNING id
+            """,
+            url.strip(),
+            (title or "").strip() or None,
+            _now_utc(),
+        )
+        assert row is not None
+        return int(row["id"])
 
 
 async def get_link(link_id: int) -> dict[str, Any] | None:
-    doc = await _links().find_one({"_id": link_id})
-    return _link_to_dict(doc)
+    assert _pool is not None
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, url, title, created_at, logo_path
+            FROM links WHERE id = $1
+            """,
+            link_id,
+        )
+        return _row(row) if row else None
 
 
 async def set_link_logo_path(link_id: int, path: str | None) -> None:
-    await _links().update_one({"_id": link_id}, {"$set": {"logo_path": path}})
+    assert _pool is not None
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE links SET logo_path = $1 WHERE id = $2",
+            path,
+            link_id,
+        )
 
 
 _UNSET = object()
@@ -138,21 +225,39 @@ async def update_link_fields(
     url: str | None = None,
     title: Any = _UNSET,
 ) -> bool:
+    """
+    Faqat berilgan maydonlarni yangilaydi.
+    title=... berilsa (bo'sh qator ham) sarlavha yangilanadi; title o'tkazilmasa — o'zgarmaydi.
+    """
     row = await get_link(link_id)
     if not row:
         return False
-    update: dict[str, Any] = {}
+    parts: list[str] = []
+    vals: list[object] = []
+    n = 1
     if url is not None:
-        update["url"] = url.strip()
+        parts.append(f"url = ${n}")
+        vals.append(url.strip())
+        n += 1
     if title is not _UNSET:
-        update["title"] = (str(title).strip() or None) if title is not None else None
-    if not update:
+        parts.append(f"title = ${n}")
+        vals.append((str(title).strip() or None) if title is not None else None)
+        n += 1
+    if not parts:
         return True
-    res = await _links().update_one({"_id": link_id}, {"$set": update})
-    return res.matched_count > 0
+    vals.append(link_id)
+    sql = f"UPDATE links SET {', '.join(parts)} WHERE id = ${n}"
+    assert _pool is not None
+    async with _pool.acquire() as conn:
+        status = await conn.execute(sql, *vals)
+        try:
+            return int(status.split()[-1]) > 0
+        except (ValueError, IndexError):
+            return True
 
 
 async def delete_link(link_id: int) -> bool:
+    """Link, tracking yozuvlari (CASCADE) va logo fayllarini o'chiradi."""
     row = await get_link(link_id)
     if not row:
         return False
@@ -160,80 +265,102 @@ async def delete_link(link_id: int) -> bool:
     if lp:
         Path(lp).unlink(missing_ok=True)
     disk_path_for_link_logo(link_id).unlink(missing_ok=True)
-    await _tracks().delete_many({"link_id": link_id})
-    await _links().delete_one({"_id": link_id})
-    return True
+    assert _pool is not None
+    async with _pool.acquire() as conn:
+        result = await conn.execute("DELETE FROM links WHERE id = $1", link_id)
+        try:
+            return int(result.split()[-1]) > 0
+        except (ValueError, IndexError):
+            return False
 
 
 async def add_promo(code: str) -> int:
     code = code.strip()
-    pid = await _next_seq("promos")
-    doc = {"_id": pid, "code": code, "created_at": _now()}
+    assert _pool is not None
     try:
-        await _promos().insert_one(doc)
-    except DuplicateKeyError as e:
-        await _counters().update_one({"_id": "promos"}, {"$inc": {"seq": -1}})
+        async with _pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO promos (code, created_at)
+                VALUES ($1, $2)
+                RETURNING id
+                """,
+                code,
+                _now_utc(),
+            )
+            assert row is not None
+            return int(row["id"])
+    except UniqueViolationError as e:
         raise sqlite3.IntegrityError("duplicate promo code") from e
-    return pid
 
 
 async def list_links() -> list[dict[str, Any]]:
-    cursor = _links().find().sort("_id", -1)
-    out: list[dict[str, Any]] = []
-    async for doc in cursor:
-        d = _link_to_dict(doc)
-        if d:
-            out.append(d)
-    return out
+    assert _pool is not None
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, url, title, created_at, logo_path
+            FROM links ORDER BY id DESC
+            """
+        )
+        return [_row(r) for r in rows]
 
 
 async def list_promos() -> list[dict[str, Any]]:
-    cursor = _promos().find().sort("_id", -1)
-    out: list[dict[str, Any]] = []
-    async for doc in cursor:
-        out.append(_promo_to_dict(doc))
-    return out
+    assert _pool is not None
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, code, created_at FROM promos ORDER BY id DESC"
+        )
+        return [_row(r) for r in rows]
 
 
 async def get_promo_code_by_id(promo_id: int) -> str | None:
-    doc = await _promos().find_one({"_id": promo_id}, projection={"code": 1})
-    if not doc:
-        return None
-    return str(doc["code"])
+    assert _pool is not None
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT code FROM promos WHERE id = $1",
+            promo_id,
+        )
+        return str(row["code"]) if row else None
 
 
 async def get_track_token(link_id: int, promo_id: int) -> str | None:
-    doc = await _tracks().find_one(
-        {"link_id": link_id, "promo_id": promo_id},
-        projection={"token": 1},
-    )
-    if not doc:
-        return None
-    return str(doc["token"])
+    assert _pool is not None
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT token FROM track_entries
+            WHERE link_id = $1 AND promo_id = $2
+            """,
+            link_id,
+            promo_id,
+        )
+        return str(row["token"]) if row else None
 
 
 async def create_track_entry(link_id: int, promo_id: int) -> str:
+    """Returns unique tracking token (existing pair returns same token)."""
     existing = await get_track_token(link_id, promo_id)
     if existing:
         return existing
+    assert _pool is not None
     for _ in range(4):
         token = secrets.token_urlsafe(16).rstrip("=").replace("-", "_")
-        tid = await _next_seq("track_entries")
-        doc = {
-            "_id": tid,
-            "link_id": link_id,
-            "promo_id": promo_id,
-            "token": token,
-            "clicks": 0,
-            "created_at": _now(),
-        }
         try:
-            await _tracks().insert_one(doc)
+            async with _pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO track_entries (link_id, promo_id, token, clicks, created_at)
+                    VALUES ($1, $2, $3, 0, $4)
+                    """,
+                    link_id,
+                    promo_id,
+                    token,
+                    _now_utc(),
+                )
             return token
-        except DuplicateKeyError:
-            await _counters().update_one(
-                {"_id": "track_entries"}, {"$inc": {"seq": -1}}
-            )
+        except UniqueViolationError:
             again = await get_track_token(link_id, promo_id)
             if again:
                 return again
@@ -242,58 +369,74 @@ async def create_track_entry(link_id: int, promo_id: int) -> str:
 
 
 async def get_link_url_by_token(token: str) -> str | None:
-    tdoc = await _tracks().find_one({"token": token}, projection={"link_id": 1})
-    if not tdoc:
-        return None
-    link = await _links().find_one({"_id": tdoc["link_id"]}, projection={"url": 1})
-    if not link:
-        return None
-    return str(link["url"])
+    assert _pool is not None
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT l.url AS url
+            FROM track_entries t
+            JOIN links l ON l.id = t.link_id
+            WHERE t.token = $1
+            """,
+            token,
+        )
+        return str(row["url"]) if row else None
 
 
 async def increment_click(token: str) -> None:
-    await _tracks().update_one({"token": token}, {"$inc": {"clicks": 1}})
+    assert _pool is not None
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE track_entries SET clicks = clicks + 1 WHERE token = $1
+            """,
+            token,
+        )
 
 
 async def stats_summary() -> list[dict[str, Any]]:
-    links = await list_links()
-    promos = await list_promos()
-    links_sorted = sorted(links, key=lambda r: r["url"])
-    promos_sorted = sorted(promos, key=lambda r: str(r["code"]).lower())
-
-    track_map: dict[tuple[int, int], int] = {}
-    async for t in _tracks().find():
-        track_map[(int(t["link_id"]), int(t["promo_id"]))] = int(t.get("clicks") or 0)
-
-    rows: list[dict[str, Any]] = []
-    for p in promos_sorted:
-        for l in links_sorted:
-            clicks = track_map.get((int(l["id"]), int(p["id"])), 0)
-            rows.append(
-                {
-                    "link_url": l["url"],
-                    "link_title": l.get("title"),
-                    "promo_code": p["code"],
-                    "clicks": clicks,
-                }
-            )
-    return rows
+    """Har bir link × promo juftligi: QR bo'lmasa ham 0 yuklanish bilan chiqadi."""
+    assert _pool is not None
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT l.url AS link_url,
+                   l.title AS link_title,
+                   p.code AS promo_code,
+                   COALESCE(t.clicks, 0)::bigint AS clicks
+            FROM links l
+            CROSS JOIN promos p
+            LEFT JOIN track_entries t
+              ON t.link_id = l.id AND t.promo_id = p.id
+            ORDER BY LOWER(p.code), l.url ASC
+            """
+        )
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            d = _row(r)
+            d["clicks"] = int(d["clicks"])
+            out.append(d)
+        return out
 
 
 async def stats_for_link(link_id: int) -> list[dict[str, Any]]:
-    promos = await list_promos()
-    promos_sorted = sorted(promos, key=lambda r: str(r["code"]).lower())
-
-    track_map: dict[int, int] = {}
-    async for t in _tracks().find({"link_id": link_id}):
-        track_map[int(t["promo_id"])] = int(t.get("clicks") or 0)
-
-    rows: list[dict[str, Any]] = []
-    for p in promos_sorted:
-        rows.append(
-            {
-                "promo_code": p["code"],
-                "clicks": track_map.get(int(p["id"]), 0),
-            }
+    """Bitta link uchun: har bir promo va yuklanishlar (track bo'lmasa 0)."""
+    assert _pool is not None
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT p.code AS promo_code,
+                   COALESCE(t.clicks, 0)::bigint AS clicks
+            FROM promos p
+            LEFT JOIN track_entries t
+              ON t.promo_id = p.id AND t.link_id = $1
+            ORDER BY LOWER(p.code)
+            """,
+            link_id,
         )
-    return rows
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            d = _row(r)
+            d["clicks"] = int(d["clicks"])
+            out.append(d)
+        return out
