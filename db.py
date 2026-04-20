@@ -25,17 +25,12 @@ def _mongo_uri() -> str:
 def _get_client() -> AsyncIOMotorClient:
     global _client
     if _client is None:
-        import ssl
-
-        ssl_context = ssl.create_default_context()
-        ssl_context.check_hostname = False
-        ssl_context.verify_mode = ssl.CERT_NONE
-        _client = AsyncIOMotorClient(
-            _mongo_uri(),
-            tls=True,
-            tlsAllowInvalidCertificates=True,
-            tlsContext=ssl_context,
-        )
+        uri = _mongo_uri()
+        # Python 3.14 SSL muammosini hal qilish
+        sep = "&" if "?" in uri else "?"
+        if "tlsAllowInvalidCertificates" not in uri:
+            uri = f"{uri}{sep}tlsAllowInvalidCertificates=true"
+        _client = AsyncIOMotorClient(uri)
     return _client
 
 
