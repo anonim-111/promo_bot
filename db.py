@@ -137,10 +137,20 @@ async def init_db() -> None:
         )
         await conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS promo_groups (
+                id BIGSERIAL PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                created_at TIMESTAMPTZ NOT NULL
+            );
+            """
+        )
+        await conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS promos (
                 id BIGSERIAL PRIMARY KEY,
                 code TEXT NOT NULL UNIQUE,
-                created_at TIMESTAMPTZ NOT NULL
+                created_at TIMESTAMPTZ NOT NULL,
+                group_id BIGINT REFERENCES promo_groups(id) ON DELETE RESTRICT
             );
             """
         )
@@ -168,6 +178,55 @@ async def _migrate_schema() -> None:
     async with _pool.acquire() as conn:
         await conn.execute(
             "ALTER TABLE links ADD COLUMN IF NOT EXISTS logo_path TEXT;"
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS promo_groups (
+                id BIGSERIAL PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                created_at TIMESTAMPTZ NOT NULL
+            );
+            """
+        )
+        await conn.execute(
+            "ALTER TABLE promos ADD COLUMN IF NOT EXISTS group_id BIGINT;"
+        )
+        await conn.execute(
+            """
+            DO $$
+            DECLARE
+                gid BIGINT;
+            BEGIN
+                INSERT INTO promo_groups (name, created_at)
+                VALUES ('Umumiy', NOW())
+                ON CONFLICT (name) DO NOTHING;
+
+                SELECT id INTO gid FROM promo_groups WHERE name = 'Umumiy' LIMIT 1;
+                UPDATE promos SET group_id = gid WHERE group_id IS NULL;
+            END $$;
+            """
+        )
+        await conn.execute(
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM pg_constraint
+                    WHERE conname = 'promos_group_id_fkey'
+                ) THEN
+                    ALTER TABLE promos
+                    ADD CONSTRAINT promos_group_id_fkey
+                    FOREIGN KEY (group_id) REFERENCES promo_groups(id) ON DELETE RESTRICT;
+                END IF;
+            END $$;
+            """
+        )
+        await conn.execute(
+            "ALTER TABLE promos ALTER COLUMN group_id SET NOT NULL;"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_promos_group_id ON promos(group_id);"
         )
 
 
@@ -274,19 +333,75 @@ async def delete_link(link_id: int) -> bool:
             return False
 
 
-async def add_promo(code: str) -> int:
-    code = code.strip()
+async def add_group(name: str) -> int:
+    cleaned = name.strip()
     assert _pool is not None
     try:
         async with _pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                INSERT INTO promos (code, created_at)
+                INSERT INTO promo_groups (name, created_at)
                 VALUES ($1, $2)
+                RETURNING id
+                """,
+                cleaned,
+                _now_utc(),
+            )
+            assert row is not None
+            return int(row["id"])
+    except UniqueViolationError as e:
+        raise sqlite3.IntegrityError("duplicate group name") from e
+
+
+async def ensure_group(name: str) -> int:
+    """Guruh bor bo'lsa id ni qaytaradi, yo'q bo'lsa yaratadi."""
+    cleaned = name.strip()
+    assert _pool is not None
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id FROM promo_groups WHERE name = $1",
+            cleaned,
+        )
+        if row is not None:
+            return int(row["id"])
+    return await add_group(cleaned)
+
+
+async def list_groups() -> list[dict[str, Any]]:
+    assert _pool is not None
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, name, created_at FROM promo_groups ORDER BY LOWER(name), id"
+        )
+        return [_row(r) for r in rows]
+
+
+async def get_group(group_id: int) -> dict[str, Any] | None:
+    assert _pool is not None
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, name, created_at FROM promo_groups WHERE id = $1",
+            group_id,
+        )
+        return _row(row) if row else None
+
+
+async def add_promo(code: str, group_id: int) -> int:
+    code = code.strip()
+    assert _pool is not None
+    if not await get_group(group_id):
+        raise ValueError("group not found")
+    try:
+        async with _pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO promos (code, created_at, group_id)
+                VALUES ($1, $2, $3)
                 RETURNING id
                 """,
                 code,
                 _now_utc(),
+                group_id,
             )
             assert row is not None
             return int(row["id"])
@@ -310,7 +425,28 @@ async def list_promos() -> list[dict[str, Any]]:
     assert _pool is not None
     async with _pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT id, code, created_at FROM promos ORDER BY id DESC"
+            """
+            SELECT p.id, p.code, p.created_at, p.group_id, g.name AS group_name
+            FROM promos p
+            JOIN promo_groups g ON g.id = p.group_id
+            ORDER BY p.id DESC
+            """
+        )
+        return [_row(r) for r in rows]
+
+
+async def list_promos_by_group(group_id: int) -> list[dict[str, Any]]:
+    assert _pool is not None
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT p.id, p.code, p.created_at, p.group_id, g.name AS group_name
+            FROM promos p
+            JOIN promo_groups g ON g.id = p.group_id
+            WHERE p.group_id = $1
+            ORDER BY LOWER(p.code), p.id DESC
+            """,
+            group_id,
         )
         return [_row(r) for r in rows]
 
@@ -323,6 +459,59 @@ async def get_promo_code_by_id(promo_id: int) -> str | None:
             promo_id,
         )
         return str(row["code"]) if row else None
+
+
+async def get_promo(promo_id: int) -> dict[str, Any] | None:
+    assert _pool is not None
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT p.id, p.code, p.created_at, p.group_id, g.name AS group_name
+            FROM promos p
+            JOIN promo_groups g ON g.id = p.group_id
+            WHERE p.id = $1
+            """,
+            promo_id,
+        )
+        return _row(row) if row else None
+
+
+async def update_promo_fields(
+    promo_id: int,
+    *,
+    code: Any = _UNSET,
+    group_id: Any = _UNSET,
+) -> bool:
+    row = await get_promo(promo_id)
+    if not row:
+        return False
+    parts: list[str] = []
+    vals: list[object] = []
+    n = 1
+    if code is not _UNSET:
+        parts.append(f"code = ${n}")
+        vals.append(str(code).strip())
+        n += 1
+    if group_id is not _UNSET:
+        if not isinstance(group_id, int) or not await get_group(group_id):
+            return False
+        parts.append(f"group_id = ${n}")
+        vals.append(group_id)
+        n += 1
+    if not parts:
+        return True
+    vals.append(promo_id)
+    sql = f"UPDATE promos SET {', '.join(parts)} WHERE id = ${n}"
+    assert _pool is not None
+    try:
+        async with _pool.acquire() as conn:
+            status = await conn.execute(sql, *vals)
+            try:
+                return int(status.split()[-1]) > 0
+            except (ValueError, IndexError):
+                return True
+    except UniqueViolationError as e:
+        raise sqlite3.IntegrityError("duplicate promo code") from e
 
 
 async def get_track_token(link_id: int, promo_id: int) -> str | None:
@@ -366,6 +555,80 @@ async def create_track_entry(link_id: int, promo_id: int) -> str:
                 return again
             continue
     raise RuntimeError("track_entries uchun token yaratib bo'lmadi")
+
+
+async def ensure_track_tokens_for_promos(
+    link_id: int, promo_ids: list[int]
+) -> dict[int, str]:
+    """
+    Bir nechta promo uchun tokenlarni bir ulanishda tayyorlaydi (Excel / mass export uchun).
+    Mavjud juftliklar o'zgarmaydi.
+    """
+    if not promo_ids:
+        return {}
+    unique_ids = list(dict.fromkeys(promo_ids))
+    assert _pool is not None
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT promo_id, token
+            FROM track_entries
+            WHERE link_id = $1 AND promo_id = ANY($2::bigint[])
+            """,
+            link_id,
+            unique_ids,
+        )
+        out: dict[int, str] = {int(r["promo_id"]): str(r["token"]) for r in rows}
+        missing = [pid for pid in unique_ids if pid not in out]
+        if not missing:
+            return out
+        now = _now_utc()
+        batch: list[tuple[int, str, datetime]] = []
+        for pid in missing:
+            token = secrets.token_urlsafe(16).rstrip("=").replace("-", "_")
+            batch.append((pid, token, now))
+        try:
+            await conn.executemany(
+                """
+                INSERT INTO track_entries (link_id, promo_id, token, clicks, created_at)
+                VALUES ($1, $2, $3, 0, $4)
+                """,
+                [(link_id, pid, tok, ts) for pid, tok, ts in batch],
+            )
+        except UniqueViolationError:
+            for pid, tok, ts in batch:
+                try:
+                    await conn.execute(
+                        """
+                        INSERT INTO track_entries (link_id, promo_id, token, clicks, created_at)
+                        VALUES ($1, $2, $3, 0, $4)
+                        """,
+                        link_id,
+                        pid,
+                        tok,
+                        ts,
+                    )
+                except UniqueViolationError:
+                    row = await conn.fetchrow(
+                        """
+                        SELECT token FROM track_entries
+                        WHERE link_id = $1 AND promo_id = $2
+                        """,
+                        link_id,
+                        pid,
+                    )
+                    if row:
+                        out[pid] = str(row["token"])
+        rows2 = await conn.fetch(
+            """
+            SELECT promo_id, token
+            FROM track_entries
+            WHERE link_id = $1 AND promo_id = ANY($2::bigint[])
+            """,
+            link_id,
+            unique_ids,
+        )
+        return {int(r["promo_id"]): str(r["token"]) for r in rows2}
 
 
 async def get_link_url_by_token(token: str) -> str | None:
@@ -433,6 +696,79 @@ async def stats_for_link(link_id: int) -> list[dict[str, Any]]:
             ORDER BY LOWER(p.code)
             """,
             link_id,
+        )
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            d = _row(r)
+            d["clicks"] = int(d["clicks"])
+            out.append(d)
+        return out
+
+
+async def stats_for_group(group_id: int) -> list[dict[str, Any]]:
+    """Bitta guruh uchun: har bir promo va jami yuklanishlar."""
+    assert _pool is not None
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT p.id AS promo_id,
+                   p.code AS promo_code,
+                   COALESCE(SUM(t.clicks), 0)::bigint AS clicks
+            FROM promos p
+            LEFT JOIN track_entries t
+              ON t.promo_id = p.id
+            WHERE p.group_id = $1
+            GROUP BY p.id, p.code
+            ORDER BY COALESCE(SUM(t.clicks), 0) DESC, LOWER(p.code)
+            """,
+            group_id,
+        )
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            d = _row(r)
+            d["clicks"] = int(d["clicks"])
+            out.append(d)
+        return out
+
+
+async def stats_summary_by_group() -> list[dict[str, Any]]:
+    """Barcha guruhlar bo'yicha promo kesimidagi jami yuklanishlar."""
+    assert _pool is not None
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT g.name AS group_name,
+                   p.code AS promo_code,
+                   COALESCE(SUM(t.clicks), 0)::bigint AS clicks
+            FROM promos p
+            JOIN promo_groups g ON g.id = p.group_id
+            LEFT JOIN track_entries t ON t.promo_id = p.id
+            GROUP BY g.name, p.code
+            ORDER BY LOWER(g.name), LOWER(p.code)
+            """
+        )
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            d = _row(r)
+            d["clicks"] = int(d["clicks"])
+            out.append(d)
+        return out
+
+
+async def stats_group_totals_desc() -> list[dict[str, Any]]:
+    """Guruhlar bo'yicha jami yuklanishlar (kamayish tartibida)."""
+    assert _pool is not None
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT g.name AS group_name,
+                   COALESCE(SUM(t.clicks), 0)::bigint AS clicks
+            FROM promo_groups g
+            LEFT JOIN promos p ON p.group_id = g.id
+            LEFT JOIN track_entries t ON t.promo_id = p.id
+            GROUP BY g.name
+            ORDER BY COALESCE(SUM(t.clicks), 0) DESC, LOWER(g.name)
+            """
         )
         out: list[dict[str, Any]] = []
         for r in rows:

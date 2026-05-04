@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Literal
 
 import qrcode
-from qrcode.constants import ERROR_CORRECT_H, ERROR_CORRECT_M
+from qrcode.constants import ERROR_CORRECT_H, ERROR_CORRECT_L, ERROR_CORRECT_M
 from qrcode.image.styledpil import StyledPilImage
 from qrcode.image.styles.colormasks import RadialGradiantColorMask, SolidFillColorMask
 from qrcode.image.styles.moduledrawers import RoundedModuleDrawer, SquareModuleDrawer
@@ -87,6 +87,25 @@ def render_tracking_qr_png(
     qr.make(fit=True)
 
     img = qr.make_image(**kwargs)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def excel_inline_qr_png(url: str, *, box_size: int = 4) -> bytes:
+    """
+    Excelga joylash uchun kichik oq-qora QR (logo va rangsiz) — tez generatsiya.
+    ERROR_CORRECT_L + kichik box_size.
+    """
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=ERROR_CORRECT_L,
+        box_size=box_size,
+        border=1,
+    )
+    qr.add_data(url)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()

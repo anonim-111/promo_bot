@@ -1,6 +1,8 @@
 import asyncio
 import sqlite3
+from datetime import datetime
 from html import escape as html_escape
+from io import BytesIO
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -21,11 +23,14 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
 )
+from openpyxl import Workbook
+from openpyxl.drawing.image import Image as XLImage
+from openpyxl.styles import Font
 
 import db
 from config import BASE_URL, BOT_TOKEN, TELEGRAM_HTTP_TIMEOUT, is_admin
 from link_logo import download_and_save_link_logo
-from qr_image import render_tracking_qr_png
+from qr_image import excel_inline_qr_png, render_tracking_qr_png
 
 router = Router()
 
@@ -34,6 +39,7 @@ MAIN_MENU_TEXTS = frozenset(
     {
         "➕ Link qo'shish",
         "🎟 Promo kod qo'shish",
+        "📁 Guruh qo'shish",
         "📱 QR yaratish",
         "📊 Statistika",
         "📋 Linklar",
@@ -43,14 +49,17 @@ MAIN_MENU_TEXTS = frozenset(
 
 _SAFE_CHUNK = 3800
 
-
 def main_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="➕ Link qo'shish")],
             [KeyboardButton(text="🎟 Promo kod qo'shish")],
+            [
+                KeyboardButton(text="📋 Linklar"),
+                KeyboardButton(text="🎟 Promolar"),
+                KeyboardButton(text="📁 Guruh qo'shish"),
+            ],
             [KeyboardButton(text="📱 QR yaratish"), KeyboardButton(text="📊 Statistika")],
-            [KeyboardButton(text="📋 Linklar"), KeyboardButton(text="🎟 Promolar")],
         ],
         resize_keyboard=True,
     )
@@ -62,6 +71,7 @@ class AddLinkStates(StatesGroup):
 
 
 class AddPromoStates(StatesGroup):
+    waiting_group = State()
     waiting_code = State()
 
 
@@ -74,6 +84,14 @@ class EditLinkStates(StatesGroup):
     waiting_title = State()
 
 
+class EditPromoStates(StatesGroup):
+    waiting_code = State()
+
+
+class AddGroupStates(StatesGroup):
+    waiting_name = State()
+
+
 def _is_valid_http_url(url: str) -> bool:
     u = urlparse(url.strip())
     return u.scheme in ("http", "https") and bool(u.netloc)
@@ -82,6 +100,17 @@ def _is_valid_http_url(url: str) -> bool:
 def _h(text: str) -> str:
     """Telegram HTML matn uchun xavfsiz qochirish."""
     return html_escape(text, quote=False)
+
+
+def _h_attr(url: str) -> str:
+    """HTML atribut (masalan <a href=\"...\">) uchun."""
+    return html_escape(url.strip(), quote=True)
+
+
+def _caption_tracking_link(tracking_url: str) -> str:
+    """Telegramda bosiladigan havola: <code> ichidagi URL bosilmaydi."""
+    u = tracking_url.strip()
+    return f"<b>Havola</b>:\n<a href=\"{_h_attr(u)}\">{_h(u)}</a>"
 
 
 BTN_MENU = InlineKeyboardButton(text="◀️ Menyuga", callback_data="hm:main")
@@ -95,13 +124,19 @@ def _kb_menu_only() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[_row_menu()])
 
 
-def _kb_after_qr_batch(link_id: int) -> InlineKeyboardMarkup:
+def _kb_after_qr_batch(link_id: int, *, group_id: int | None = None) -> InlineKeyboardMarkup:
+    if group_id is not None:
+        back_cd = f"qrg:{link_id}:{group_id}"
+        back_txt = "◀️ Guruhdagi promolar"
+    else:
+        back_cd = f"qrgl:{link_id}"
+        back_txt = "◀️ Guruhlar"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="◀️ Promo tanlash",
-                    callback_data=f"qr:bp:{link_id}",
+                    text=back_txt,
+                    callback_data=back_cd,
                 )
             ],
             _row_menu(),
@@ -124,8 +159,32 @@ def _kb_bulk_qr_style_pick(link_id: int) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    text="◀️ Promo tanlash",
-                    callback_data=f"qr:bp:{link_id}",
+                    text="◀️ Guruhlar",
+                    callback_data=f"qrgl:{link_id}",
+                )
+            ],
+            _row_menu(),
+        ]
+    )
+
+
+def _kb_bulk_qr_style_pick_group(link_id: int, group_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🎨 Rangli",
+                    callback_data=f"qallg:{link_id}:{group_id}:r",
+                ),
+                InlineKeyboardButton(
+                    text="⬛ Oq-qora",
+                    callback_data=f"qallg:{link_id}:{group_id}:s",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="◀️ Guruhdagi promolar",
+                    callback_data=f"qrg:{link_id}:{group_id}",
                 )
             ],
             _row_menu(),
@@ -139,6 +198,46 @@ async def _send_bulk_qr_style_prompt(message: Message, link_id: int) -> None:
         parse_mode=ParseMode.HTML,
         reply_markup=_kb_bulk_qr_style_pick(link_id),
     )
+
+
+async def _send_bulk_qr_style_prompt_group(
+    message: Message, link_id: int, group_id: int
+) -> None:
+    await message.answer(
+        "📦 <b>Guruhdagi barcha promo</b> — QR uslubini tanlang:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=_kb_bulk_qr_style_pick_group(link_id, group_id),
+    )
+
+
+def _build_tracking_links_excel(rows: list[tuple[str, str, str]]) -> bytes:
+    wb = Workbook()
+    ws = wb.active
+    assert ws is not None
+    ws.title = "Tracking"
+    ws.append(["Guruh", "Promo kod", "Tracking havola", "QR"])
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+    for row_idx, (g_name, code, url) in enumerate(rows, start=2):
+        ws.cell(row=row_idx, column=1, value=g_name)
+        ws.cell(row=row_idx, column=2, value=code)
+        ws.cell(row=row_idx, column=3, value=url)
+        try:
+            png = excel_inline_qr_png(url)
+        except Exception:
+            continue
+        img = XLImage(BytesIO(png))
+        img.width = 120
+        img.height = 120
+        ws.add_image(img, f"D{row_idx}")
+        ws.row_dimensions[row_idx].height = 96
+    ws.column_dimensions["A"].width = 34
+    ws.column_dimensions["B"].width = 40
+    ws.column_dimensions["C"].width = 56
+    ws.column_dimensions["D"].width = 18
+    bio = BytesIO()
+    wb.save(bio)
+    return bio.getvalue()
 
 
 def _kb_link_detail(link_id: int) -> InlineKeyboardMarkup:
@@ -276,6 +375,120 @@ def _split_html_lines(lines: list[str]) -> list[str]:
     return chunks or [""]
 
 
+async def _send_promo_groups_pick(
+    message: Message,
+    *,
+    intro: str,
+    prefix: str,
+    include_menu: bool = True,
+) -> bool:
+    groups = await db.list_groups()
+    if not groups:
+        await message.answer(
+            "Hozircha promo guruhlar yo'q. Avval bazaga kamida bitta guruh qo'shing.",
+            reply_markup=_kb_menu_only() if include_menu else None,
+        )
+        return False
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=f"📁 {g['name'][:52]}",
+                callback_data=f"{prefix}:{g['id']}",
+            )
+        ]
+        for g in groups[:60]
+    ]
+    if include_menu:
+        rows.append(_row_menu())
+    await message.answer(
+        intro,
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    return True
+
+
+def _kb_promo_detail(promo_id: int, group_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✏️ Kodni o'zgartirish",
+                    callback_data=f"pec:{promo_id}",
+                ),
+                InlineKeyboardButton(
+                    text="📁 Guruhni almashtirish",
+                    callback_data=f"peg:{promo_id}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="◀️ Ro'yxatga",
+                    callback_data=f"pg:{group_id}",
+                ),
+                BTN_MENU,
+            ],
+        ]
+    )
+
+
+async def _send_promo_detail(message: Message, promo_id: int) -> None:
+    row = await db.get_promo(promo_id)
+    if not row:
+        await message.answer("Promo topilmadi.", reply_markup=_kb_menu_only())
+        return
+    text = (
+        f"<b>Promo #{promo_id}</b>\n"
+        f"<b>Kod</b>: <code>{_h(row['code'])}</code>\n"
+        f"<b>Guruh</b>: {_h(row['group_name'])}"
+    )
+    await message.answer(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=_kb_promo_detail(promo_id, int(row["group_id"])),
+    )
+
+
+async def _send_promos_in_group(message: Message, group_id: int) -> None:
+    group = await db.get_group(group_id)
+    if not group:
+        await message.answer("Guruh topilmadi.", reply_markup=_kb_menu_only())
+        return
+    promos = await db.list_promos_by_group(group_id)
+    if not promos:
+        await message.answer(
+            f"📁 <b>{_h(group['name'])}</b>\n\nBu guruhda promolar yo'q.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="◀️ Guruhlarga", callback_data="pg:list")],
+                    _row_menu(),
+                ]
+            ),
+        )
+        return
+    buttons = [
+        [
+            InlineKeyboardButton(
+                text=p["code"][:60],
+                callback_data=f"pp:{group_id}:{p['id']}",
+            )
+        ]
+        for p in promos[:60]
+    ]
+    buttons.append(
+        [
+            InlineKeyboardButton(text="◀️ Guruhlarga", callback_data="pg:list"),
+            BTN_MENU,
+        ]
+    )
+    await message.answer(
+        f"📁 <b>{_h(group['name'])}</b>\n\nKerakli promoni tanlang:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+
+
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
@@ -290,13 +503,14 @@ async def cmd_help(message: Message) -> None:
     if not message.from_user or not is_admin(message.from_user.id):
         return
     await message.answer(
-        "1) Avval <b>Link</b> va <b>Promo kod</b> qo'shing.\n"
-        "2) <b>QR yaratish</b> — link, promo, uslub; «📦 Barcha promo uchun QR» da "
-        "avval rangli yoki oq-qora tanlanadi.\n"
-        "3) <b>Statistika</b> — avval linkni tanlang, keyin promo kodlar va yuklanishlar.\n"
-        "4) Har bir link uchun QR markazidagi logotip — link qo'shganda yoki "
+        "1) Avval <b>Link</b> va <b>Promo guruh/kod</b> qo'shing.\n"
+        "2) <b>📁 Guruh qo'shish</b> — yangi promo guruh nomi (takroriysiz).\n"
+        "3) <b>QR yaratish</b> — link, keyin guruh, promo yoki guruhdagi/barcha promo "
+        "uchun QR; tracking havolalar Excel ham mavjud.\n"
+        "4) <b>Statistika</b> — guruh va yuklanishlar, Excel export.\n"
+        "5) Har bir link uchun QR markazidagi logotip — link qo'shganda yoki "
         "<b>📋 Linklar</b> → link kartochkasidagi <b>Logotipni almashtirish</b>.\n"
-        "5) <b>📋 Linklar</b> — tahrir, logotip va o'chirish ham shu yerda.\n\n"
+        "6) <b>📋 Linklar</b> — tahrir, logotip va o'chirish ham shu yerda.\n\n"
         f"Tracking URL ko'rinishi: <code>{_h(BASE_URL)}/r/token</code>",
         parse_mode=ParseMode.HTML,
         reply_markup=_kb_menu_only(),
@@ -328,12 +542,48 @@ async def add_link_prompt(message: Message, state: FSMContext) -> None:
     )
 
 
+@router.message(F.text == "📁 Guruh qo'shish")
+async def add_group_prompt(message: Message, state: FSMContext) -> None:
+    if _deny(message):
+        return
+    await state.set_state(AddGroupStates.waiting_name)
+    await message.answer(
+        "Yangi promo <b>guruh nomini</b> yuboring.\nBekor qilish: /cancel",
+        parse_mode=ParseMode.HTML,
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@router.message(AddGroupStates.waiting_name, F.text & ~F.text.startswith("/"))
+async def add_group_save(message: Message, state: FSMContext) -> None:
+    if _deny(message):
+        return
+    name = (message.text or "").strip()
+    if len(name) < 2:
+        await message.answer("Nom juda qisqa.")
+        return
+    try:
+        gid = await db.add_group(name)
+    except sqlite3.IntegrityError:
+        await message.answer("Bu nom bilan guruh allaqachon mavjud.")
+        return
+    await state.clear()
+    await message.answer(
+        f"✅ Guruh saqlandi (id: <code>{gid}</code>).",
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_kb(),
+    )
+
+
 @router.message(AddLinkStates.waiting_url, F.text.in_(MAIN_MENU_TEXTS))
 @router.message(AddLinkStates.optional_logo, F.text.in_(MAIN_MENU_TEXTS))
+@router.message(AddPromoStates.waiting_group, F.text.in_(MAIN_MENU_TEXTS))
 @router.message(AddPromoStates.waiting_code, F.text.in_(MAIN_MENU_TEXTS))
+@router.message(AddGroupStates.waiting_name, F.text.in_(MAIN_MENU_TEXTS))
 @router.message(LogoForLinkStates.waiting_file, F.text.in_(MAIN_MENU_TEXTS))
 @router.message(EditLinkStates.waiting_new_url, F.text.in_(MAIN_MENU_TEXTS))
 @router.message(EditLinkStates.waiting_title, F.text.in_(MAIN_MENU_TEXTS))
+@router.message(EditPromoStates.waiting_code, F.text.in_(MAIN_MENU_TEXTS))
 async def fsm_to_main_menu(message: Message, state: FSMContext) -> None:
     """FSM ichida pastki menyu tugmalari — holatni tozalaydi va buyruqni bajaradi."""
     if _deny(message):
@@ -352,6 +602,8 @@ async def fsm_to_main_menu(message: Message, state: FSMContext) -> None:
         await add_link_prompt(message, state)
     elif text == "🎟 Promo kod qo'shish":
         await add_promo_prompt(message, state)
+    elif text == "📁 Guruh qo'shish":
+        await add_group_prompt(message, state)
 
 
 @router.callback_query(F.data == "hm:main")
@@ -603,23 +855,68 @@ async def add_link_save_logo(message: Message, state: FSMContext) -> None:
 async def add_promo_prompt(message: Message, state: FSMContext) -> None:
     if _deny(message):
         return
-    await state.set_state(AddPromoStates.waiting_code)
+    await state.set_state(AddPromoStates.waiting_group)
     await message.answer(
-        "Promo kod matnini yuboring (masalan: SUMMER2026).\nBekor qilish: /cancel",
+        "Yangi promo uchun avval guruhni tanlang:",
         reply_markup=ReplyKeyboardRemove(),
     )
+    await _send_promo_groups_pick(
+        message,
+        intro="📁 <b>Promo guruhlar</b>\n\nTanlang:",
+        prefix="apg",
+        include_menu=False,
+    )
+
+
+@router.callback_query(F.data.startswith("apg:"))
+async def add_promo_pick_group(callback: CallbackQuery, state: FSMContext) -> None:
+    if not callback.from_user or not is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+    try:
+        group_id = int(callback.data.split(":")[1])
+    except (IndexError, ValueError):
+        await callback.answer("Xato", show_alert=True)
+        return
+    group = await db.get_group(group_id)
+    if not group:
+        await callback.answer("Guruh topilmadi", show_alert=True)
+        return
+    await state.update_data(add_promo_group_id=group_id)
+    await state.set_state(AddPromoStates.waiting_code)
+    if callback.message:
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except TelegramBadRequest:
+            pass
+        await callback.message.answer(
+            f"📁 Tanlandi: <b>{_h(group['name'])}</b>\n\n"
+            "Promo kod matnini yuboring (masalan: SUMMER2026).",
+            parse_mode=ParseMode.HTML,
+        )
+    await callback.answer()
 
 
 @router.message(AddPromoStates.waiting_code, F.text & ~F.text.startswith("/"))
 async def add_promo_save(message: Message, state: FSMContext) -> None:
     if _deny(message):
         return
+    data = await state.get_data()
+    group_id = data.get("add_promo_group_id")
+    if not isinstance(group_id, int):
+        await state.clear()
+        await message.answer("Guruh tanlanmadi. Qaytadan boshlang.", reply_markup=main_kb())
+        return
     code = (message.text or "").strip()
     if len(code) < 2:
         await message.answer("Kod juda qisqa.")
         return
     try:
-        pid = await db.add_promo(code)
+        pid = await db.add_promo(code, group_id)
+    except ValueError:
+        await state.clear()
+        await message.answer("Guruh topilmadi. Qaytadan urinib ko'ring.", reply_markup=main_kb())
+        return
     except sqlite3.IntegrityError:
         await message.answer("Bu promo kod allaqachon mavjud.")
         return
@@ -641,32 +938,204 @@ async def list_links_cmd(message: Message) -> None:
 async def list_promos_cmd(message: Message) -> None:
     if _deny(message):
         return
-    rows = await db.list_promos()
-    if not rows:
-        await message.answer(
-            "Hozircha promo kodlar yo'q.",
-            reply_markup=_kb_menu_only(),
-        )
+    await _send_promo_groups_pick(
+        message,
+        intro="🎟 <b>Promolar</b>\n\nAvval guruhni tanlang:",
+        prefix="pg",
+    )
+
+
+@router.callback_query(F.data == "pg:list")
+async def promo_groups_list_back(callback: CallbackQuery) -> None:
+    if not callback.from_user or not is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
         return
-    lines = [
-        f"• <code>{r['id']}</code> — <code>{_h(r['code'])}</code>" for r in rows
-    ]
-    parts = _split_html_lines(lines)
-    for i, part in enumerate(parts):
-        await message.answer(
-            part,
-            parse_mode=ParseMode.HTML,
-            reply_markup=_kb_menu_only() if i == len(parts) - 1 else None,
+    if callback.message:
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except TelegramBadRequest:
+            pass
+        await _send_promo_groups_pick(
+            callback.message,
+            intro="🎟 <b>Promolar</b>\n\nAvval guruhni tanlang:",
+            prefix="pg",
         )
+    await callback.answer()
 
 
-def _kb_stats_detail() -> InlineKeyboardMarkup:
+@router.callback_query(F.data.startswith("pg:"))
+async def promo_group_open(callback: CallbackQuery) -> None:
+    if not callback.from_user or not is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+    try:
+        group_id = int(callback.data.split(":")[1])
+    except (IndexError, ValueError):
+        await callback.answer("Xato", show_alert=True)
+        return
+    if callback.message:
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except TelegramBadRequest:
+            pass
+        await _send_promos_in_group(callback.message, group_id)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("pp:"))
+async def promo_detail_open(callback: CallbackQuery) -> None:
+    if not callback.from_user or not is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        await callback.answer("Xato", show_alert=True)
+        return
+    try:
+        promo_id = int(parts[2])
+    except ValueError:
+        await callback.answer("Xato", show_alert=True)
+        return
+    if callback.message:
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except TelegramBadRequest:
+            pass
+        await _send_promo_detail(callback.message, promo_id)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("pec:"))
+async def promo_edit_code_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not callback.from_user or not is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+    try:
+        promo_id = int(callback.data.split(":")[1])
+    except (IndexError, ValueError):
+        await callback.answer("Xato", show_alert=True)
+        return
+    promo = await db.get_promo(promo_id)
+    if not promo:
+        await callback.answer("Promo topilmadi", show_alert=True)
+        return
+    await state.set_state(EditPromoStates.waiting_code)
+    await state.update_data(edit_promo_id=promo_id)
+    if callback.message:
+        await callback.message.answer(
+            "Yangi promo kodni yuboring.\nBekor: /cancel",
+        )
+    await callback.answer()
+
+
+@router.message(EditPromoStates.waiting_code, F.text & ~F.text.startswith("/"))
+async def promo_edit_code_save(message: Message, state: FSMContext) -> None:
+    if _deny(message):
+        return
+    data = await state.get_data()
+    promo_id = data.get("edit_promo_id")
+    if not isinstance(promo_id, int):
+        await state.clear()
+        return
+    code = (message.text or "").strip()
+    if len(code) < 2:
+        await message.answer("Kod juda qisqa.")
+        return
+    try:
+        ok = await db.update_promo_fields(promo_id, code=code)
+    except sqlite3.IntegrityError:
+        await message.answer("Bu promo kod allaqachon mavjud.")
+        return
+    await state.clear()
+    if not ok:
+        await message.answer("Promo topilmadi.", reply_markup=main_kb())
+        return
+    await _send_promo_detail(message, promo_id)
+    await message.answer("✅", reply_markup=main_kb())
+
+
+@router.callback_query(F.data.startswith("peg:"))
+async def promo_edit_group_start(callback: CallbackQuery) -> None:
+    if not callback.from_user or not is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+    try:
+        promo_id = int(callback.data.split(":")[1])
+    except (IndexError, ValueError):
+        await callback.answer("Xato", show_alert=True)
+        return
+    promo = await db.get_promo(promo_id)
+    if not promo:
+        await callback.answer("Promo topilmadi", show_alert=True)
+        return
+    groups = await db.list_groups()
+    buttons = [
+        [
+            InlineKeyboardButton(
+                text=f"📁 {g['name'][:52]}",
+                callback_data=f"pegs:{promo_id}:{g['id']}",
+            )
+        ]
+        for g in groups[:60]
+    ]
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                text="◀️ Orqaga",
+                callback_data=f"pp:{promo['group_id']}:{promo_id}",
+            ),
+            BTN_MENU,
+        ]
+    )
+    if callback.message:
+        await callback.message.answer(
+            "Promoning yangi guruhini tanlang:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("pegs:"))
+async def promo_edit_group_save(callback: CallbackQuery) -> None:
+    if not callback.from_user or not is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        await callback.answer("Xato", show_alert=True)
+        return
+    try:
+        promo_id = int(parts[1])
+        group_id = int(parts[2])
+    except ValueError:
+        await callback.answer("Xato", show_alert=True)
+        return
+    ok = await db.update_promo_fields(promo_id, group_id=group_id)
+    if not ok:
+        await callback.answer("Promo yoki guruh topilmadi", show_alert=True)
+        return
+    if callback.message:
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except TelegramBadRequest:
+            pass
+        await _send_promo_detail(callback.message, promo_id)
+    await callback.answer("Saqlandi")
+
+
+def _kb_stats_root() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="◀️ Linklar ro'yxati",
-                    callback_data="stat:list",
+                    text="📁 Guruh bo'yicha ko'rish",
+                    callback_data="stat:glist",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📥 Excel yuklash",
+                    callback_data="stat:xlsx",
                 )
             ],
             _row_menu(),
@@ -674,56 +1143,86 @@ def _kb_stats_detail() -> InlineKeyboardMarkup:
     )
 
 
-async def _show_stats_link_list(message: Message) -> None:
-    rows = await db.list_links()
-    if not rows:
+def _kb_stats_group_detail() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="◀️ Guruhlar ro'yxati",
+                    callback_data="stat:glist",
+                )
+            ],
+            _row_menu(),
+        ]
+    )
+
+
+async def _show_stats_root(message: Message) -> None:
+    groups = await db.list_groups()
+    if not groups:
         await message.answer(
-            "Hozircha linklar yo'q.",
+            "Hozircha promo guruhlar yo'q.",
             reply_markup=_kb_menu_only(),
         )
         return
-    buttons = [
-        [
-            InlineKeyboardButton(
-                text=f"{r['id']}: {(r.get('title') or r['url'])[:48]}…",
-                callback_data=f"stat:lnk:{r['id']}",
-            )
-        ]
-        for r in rows[:30]
-    ]
-    buttons.append(_row_menu())
+    promos = await db.list_promos()
+    if not promos:
+        await message.answer(
+            "Statistika uchun avval <b>promo kod</b> qo'shing.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_kb_menu_only(),
+        )
+        return
+    totals = await db.stats_group_totals_desc()
+    lines = []
+    total_clicks = 0
+    for row in totals:
+        clicks = int(row.get("clicks") or 0)
+        total_clicks += clicks
+        raw_name = str(row.get("group_name") or "")
+        lines.append(f"{raw_name} — {clicks:,}".replace(",", " "))
+    stats_block = "\n\n".join(lines) if lines else "Hozircha ma'lumot yo'q."
     await message.answer(
-        "📊 <b>Statistika</b>\n\n"
-        "Kerakli <b>linkni</b> tanlang — promo kodlar va yuklanishlar chiqadi:",
+        "📊 <b>Yuklanishlar statistikasi</b>\n\n"
+        f"{_h(stats_block)}\n\n"
+        f"<b>Jami:</b> {_h(f'{total_clicks:,}'.replace(',', ' '))} ta yuklanish",
         parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        reply_markup=_kb_stats_root(),
     )
 
 
-async def _send_stats_for_link_detail(message: Message, link_id: int) -> None:
-    row = await db.get_link(link_id)
-    if not row:
-        await message.answer("Link topilmadi.", reply_markup=_kb_menu_only())
+async def _show_stats_group_list(message: Message) -> None:
+    await _send_promo_groups_pick(
+        message,
+        intro="📊 <b>Statistika</b>\n\nGuruhni tanlang:",
+        prefix="statg",
+    )
+
+async def _send_stats_for_group_detail(message: Message, group_id: int) -> None:
+    group = await db.get_group(group_id)
+    if not group:
+        await message.answer("Guruh topilmadi.", reply_markup=_kb_menu_only())
         return
-    stats = await db.stats_for_link(link_id)
-    u = row["url"]
-    t = (row.get("title") or "").strip()
+    stats = await db.stats_for_group(group_id)
     head = (
         "📊 <b>Statistika</b>\n"
-        f"<b>Link #{link_id}</b>" + (f" — {_h(t)}" if t else "") + "\n"
-        f"<code>{_h(u)}</code>\n\n"
-        "<b>Promo va yuklanishlar</b>\n"
+        f"<b>Guruh</b>: {_h(group['name'])}\n\n"
+        "<b>Promo va jami yuklanishlar</b>\n"
     )
     if not stats:
         promo_lines = ["<i>Hozircha promo kodlar yo'q.</i>"]
+        total_clicks = 0
     else:
+        total_clicks = sum(int(s["clicks"] or 0) for s in stats)
         promo_lines = [
             f"• <code>{_h(s['promo_code'])}</code> — "
             f"<b>{int(s['clicks'] or 0)}</b> yuklanish"
             for s in stats
         ]
+        promo_lines.append("")
+        promo_lines.append(f"<b>Jami</b>: <b>{total_clicks}</b> yuklanish")
     parts = _split_html_lines(promo_lines)
-    kb = _kb_stats_detail()
+    kb = _kb_stats_group_detail()
     messages_out: list[str] = []
     for i, p in enumerate(parts):
         prefix = head if i == 0 else "📊 <i>Davomi</i>\n\n"
@@ -736,8 +1235,40 @@ async def _send_stats_for_link_detail(message: Message, link_id: int) -> None:
         )
 
 
-@router.callback_query(F.data == "stat:list")
-async def stats_back_to_link_list(callback: CallbackQuery) -> None:
+def _build_stats_excel(rows: list[dict[str, object]]) -> bytes:
+    wb = Workbook()
+    ws = wb.active
+    assert ws is not None
+    ws.title = "Statistika"
+    ws.append(["Guruh", "Promo kod", "Yuklanishlar"])
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+    total_clicks = 0
+    for row in rows:
+        clicks = int(row.get("clicks") or 0)
+        total_clicks += clicks
+        ws.append(
+            [
+                str(row.get("group_name") or ""),
+                str(row.get("promo_code") or ""),
+                clicks,
+            ]
+        )
+    ws.append([])
+    ws.append(["Jami", "", total_clicks])
+    ws.cell(row=ws.max_row, column=1).font = Font(bold=True)
+    ws.cell(row=ws.max_row, column=3).font = Font(bold=True)
+    ws.column_dimensions["A"].width = 34
+    ws.column_dimensions["B"].width = 40
+    ws.column_dimensions["C"].width = 14
+
+    bio = BytesIO()
+    wb.save(bio)
+    return bio.getvalue()
+
+
+@router.callback_query(F.data == "stat:glist")
+async def stats_back_to_groups(callback: CallbackQuery) -> None:
     if not callback.from_user or not is_admin(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
@@ -746,29 +1277,49 @@ async def stats_back_to_link_list(callback: CallbackQuery) -> None:
             await callback.message.edit_reply_markup(reply_markup=None)
         except TelegramBadRequest:
             pass
-        await _show_stats_link_list(callback.message)
+        await _show_stats_group_list(callback.message)
     await callback.answer()
 
 
-@router.callback_query(F.data.startswith("stat:lnk:"))
-async def stats_open_link(callback: CallbackQuery) -> None:
+@router.callback_query(F.data.startswith("statg:"))
+async def stats_open_group(callback: CallbackQuery) -> None:
     if not callback.from_user or not is_admin(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     try:
-        link_id = int(callback.data.split(":")[2])
+        group_id = int(callback.data.split(":")[1])
     except (IndexError, ValueError):
         await callback.answer("Xato", show_alert=True)
         return
-    if not await db.get_link(link_id):
-        await callback.answer("Link topilmadi", show_alert=True)
+    if not await db.get_group(group_id):
+        await callback.answer("Guruh topilmadi", show_alert=True)
         return
     if callback.message:
         try:
             await callback.message.edit_reply_markup(reply_markup=None)
         except TelegramBadRequest:
             pass
-        await _send_stats_for_link_detail(callback.message, link_id)
+        await _send_stats_for_group_detail(callback.message, group_id)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "stat:xlsx")
+async def stats_export_excel(callback: CallbackQuery) -> None:
+    if not callback.from_user or not is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+    rows = await db.stats_summary_by_group()
+    if not rows:
+        await callback.answer("Statistika uchun ma'lumot yo'q", show_alert=True)
+        return
+    content = _build_stats_excel(rows)
+    filename = f"statistika_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+    file = BufferedInputFile(content, filename=filename)
+    if callback.message:
+        await callback.message.answer_document(
+            file,
+            caption="📥 Guruhlar kesimidagi statistika (Excel).",
+        )
     await callback.answer()
 
 
@@ -776,23 +1327,7 @@ async def stats_open_link(callback: CallbackQuery) -> None:
 async def stats_cmd(message: Message) -> None:
     if _deny(message):
         return
-    links = await db.list_links()
-    if not links:
-        await message.answer(
-            "Statistika uchun avval <b>link</b> qo'shing.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=_kb_menu_only(),
-        )
-        return
-    promos = await db.list_promos()
-    if not promos:
-        await message.answer(
-            "Statistika uchun avval <b>promo kod</b> qo'shing.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=_kb_menu_only(),
-        )
-        return
-    await _show_stats_link_list(message)
+    await _show_stats_root(message)
 
 
 async def _send_qr_link_pick(target: Message) -> bool:
@@ -801,6 +1336,14 @@ async def _send_qr_link_pick(target: Message) -> bool:
     if not links:
         await target.answer(
             "Avval «Link qo'shish» orqali link qo'shing.",
+            reply_markup=_kb_menu_only(),
+        )
+        return False
+    groups = await db.list_groups()
+    if not groups:
+        await target.answer(
+            "Avval promo <b>guruh</b> yarating yoki «📁 Guruh qo'shish»dan qo'shing.",
+            parse_mode=ParseMode.HTML,
             reply_markup=_kb_menu_only(),
         )
         return False
@@ -828,56 +1371,149 @@ async def _send_qr_link_pick(target: Message) -> bool:
     return True
 
 
-async def _send_qr_promo_pick(target: Message, link_id: int) -> None:
-    promos = await db.list_promos()
-    if not promos:
+async def _send_qr_group_pick(target: Message, link_id: int) -> None:
+    groups = await db.list_groups()
+    if not groups:
         await target.answer(
-            "Promo kodlar yo'q. Avval «🎟 Promo kod qo'shish» bilan qo'shing.",
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        InlineKeyboardButton(
-                            text="◀️ Link tanlash",
-                            callback_data="qr:bl",
-                        )
-                    ],
-                    _row_menu(),
-                ]
-            ),
+            "Promo guruhlar yo'q.",
+            reply_markup=_kb_menu_only(),
         )
         return
-    buttons = [
+    rows: list[list[InlineKeyboardButton]] = []
+    for g in groups[:55]:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"📁 {g['name'][:52]}",
+                    callback_data=f"qrg:{link_id}:{g['id']}",
+                )
+            ]
+        )
+    rows.append(
         [
             InlineKeyboardButton(
                 text="📦 Barcha promo uchun QR",
                 callback_data=f"qbulk:{link_id}",
             ),
-        ],
-        *[
-            [
-                InlineKeyboardButton(
-                    text=p["code"][:60], callback_data=f"qp:{link_id}:{p['id']}"
-                )
-            ]
-            for p in promos[:30]
-        ],
-    ]
-    buttons.append(
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="📥 Excel — barcha promo (havolalar)",
+                callback_data=f"qrxlall:{link_id}",
+            ),
+        ]
+    )
+    rows.append(
         [
             InlineKeyboardButton(text="◀️ Link tanlash", callback_data="qr:bl"),
             BTN_MENU,
         ]
     )
     await target.answer(
-        "Promo kodni tanlang yoki barchasi uchun birdaniga QR oling:",
+        "Avval <b>promo guruhini</b> tanlang "
+        "(yoki barcha promo uchun QR / Excel):",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+async def _send_qr_promo_pick_for_group(
+    target: Message, link_id: int, group_id: int
+) -> None:
+    group = await db.get_group(group_id)
+    if not group:
+        await target.answer("Guruh topilmadi.", reply_markup=_kb_menu_only())
+        return
+    promos = await db.list_promos_by_group(group_id)
+    buttons: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                text="📦 Shu guruhdagi barcha promo uchun QR",
+                callback_data=f"qbulkg:{link_id}:{group_id}",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text="📥 Excel — shu guruh (havolalar)",
+                callback_data=f"qrxlg:{link_id}:{group_id}",
+            ),
+        ],
+    ]
+    for p in promos[:50]:
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text=p["code"][:58],
+                    callback_data=f"qp:{link_id}:{p['id']}:{group_id}",
+                )
+            ]
+        )
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                text="◀️ Guruhlar",
+                callback_data=f"qrgl:{link_id}",
+            ),
+            BTN_MENU,
+        ]
+    )
+    await target.answer(
+        f"📁 <b>{_h(group['name'])}</b>\n\n"
+        "Promo tanlang, guruhdagi barcha uchun QR yoki Excel:",
+        parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
     )
 
 
-async def _deliver_bulk_promo_qrs(
-    message: Message, link_id: int, style: str
+async def _answer_tracking_excel(
+    message: Message,
+    link_id: int,
+    promos: list[dict[str, object]],
+    *,
+    caption: str,
 ) -> None:
-    promos = await db.list_promos()
+    if not promos:
+        await message.answer("Promo kodlar yo'q.")
+        return
+    link_row = await db.get_link(link_id)
+    if not link_row:
+        await message.answer("Link topilmadi.")
+        return
+    ids = [int(p["id"]) for p in promos]
+    token_map = await db.ensure_track_tokens_for_promos(link_id, ids)
+    rows_data: list[tuple[str, str, str]] = []
+    for p in promos:
+        pid = int(p["id"])
+        token = token_map[pid]
+        url = f"{BASE_URL}/r/{token}"
+        rows_data.append(
+            (
+                str(p.get("group_name") or ""),
+                str(p.get("code") or ""),
+                url,
+            )
+        )
+    content = await asyncio.to_thread(_build_tracking_links_excel, rows_data)
+    filename = f"qr_tracking_link{link_id}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+    await message.answer_document(
+        BufferedInputFile(content, filename=filename),
+        caption=caption,
+    )
+
+
+async def _deliver_bulk_promo_qrs(
+    message: Message,
+    link_id: int,
+    style: str,
+    *,
+    group_id: int | None = None,
+) -> None:
+    if group_id is not None:
+        promos = await db.list_promos_by_group(group_id)
+    else:
+        promos = await db.list_promos()
     if not promos:
         await message.answer(
             "Promo kodlar yo'q.",
@@ -918,10 +1554,12 @@ async def _deliver_bulk_promo_qrs(
             caption=(
                 f"<b>Promo</b>: <code>{_h(code)}</code>\n"
                 f"<b>Uslub</b>: {uslub}\n"
-                f"<b>Havola</b>:\n<code>{_h(tracking_url)}</code>"
+                f"{_caption_tracking_link(tracking_url)}"
             ),
             parse_mode=ParseMode.HTML,
-            reply_markup=_kb_after_qr_batch(link_id) if last else None,
+            reply_markup=_kb_after_qr_batch(link_id, group_id=group_id)
+            if last
+            else None,
         )
         if not last:
             await asyncio.sleep(0.35)
@@ -948,13 +1586,13 @@ async def qr_back_to_links(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
-@router.callback_query(F.data.startswith("qr:bp:"))
-async def qr_back_to_promos(callback: CallbackQuery) -> None:
+@router.callback_query(F.data.startswith("qrgl:"))
+async def qr_back_to_group_pick(callback: CallbackQuery) -> None:
     if not callback.from_user or not is_admin(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     try:
-        link_id = int(callback.data.split(":")[2])
+        link_id = int(callback.data.split(":")[1])
     except (IndexError, ValueError):
         await callback.answer("Xato", show_alert=True)
         return
@@ -966,8 +1604,125 @@ async def qr_back_to_promos(callback: CallbackQuery) -> None:
             await callback.message.edit_reply_markup(reply_markup=None)
         except TelegramBadRequest:
             pass
-        await _send_qr_promo_pick(callback.message, link_id)
+        await _send_qr_group_pick(callback.message, link_id)
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("qrg:"))
+async def qr_open_group_for_promos(callback: CallbackQuery) -> None:
+    if not callback.from_user or not is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        await callback.answer("Xato", show_alert=True)
+        return
+    try:
+        link_id = int(parts[1])
+        group_id = int(parts[2])
+    except ValueError:
+        await callback.answer("Xato", show_alert=True)
+        return
+    if not await db.get_link(link_id) or not await db.get_group(group_id):
+        await callback.answer("Ma'lumot topilmadi", show_alert=True)
+        return
+    if callback.message:
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except TelegramBadRequest:
+            pass
+        await _send_qr_promo_pick_for_group(callback.message, link_id, group_id)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("qbulkg:"))
+async def qr_bulk_group_open_style_menu(callback: CallbackQuery) -> None:
+    if not callback.from_user or not is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        await callback.answer("Xato", show_alert=True)
+        return
+    try:
+        link_id = int(parts[1])
+        group_id = int(parts[2])
+    except ValueError:
+        await callback.answer("Xato", show_alert=True)
+        return
+    if not await db.get_link(link_id) or not await db.get_group(group_id):
+        await callback.answer("Ma'lumot topilmadi", show_alert=True)
+        return
+    promos = await db.list_promos_by_group(group_id)
+    if not promos:
+        await callback.answer("Guruhda promo yo'q", show_alert=True)
+        return
+    await callback.answer()
+    if callback.message:
+        await _send_bulk_qr_style_prompt_group(
+            callback.message, link_id, group_id
+        )
+
+
+@router.callback_query(F.data.startswith("qrxlall:"))
+async def qr_excel_all_promos(callback: CallbackQuery) -> None:
+    if not callback.from_user or not is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+    try:
+        link_id = int(callback.data.split(":")[1])
+    except (IndexError, ValueError):
+        await callback.answer("Xato", show_alert=True)
+        return
+    if not await db.get_link(link_id):
+        await callback.answer("Link topilmadi", show_alert=True)
+        return
+    promos = await db.list_promos()
+    if not promos:
+        await callback.answer("Promo yo'q", show_alert=True)
+        return
+    await callback.answer("Excel tayyorlanmoqda…")
+    if callback.message:
+        await _answer_tracking_excel(
+            callback.message,
+            link_id,
+            promos,
+            caption="📥 Barcha promo uchun tracking havolalar (Excel).",
+        )
+
+
+@router.callback_query(F.data.startswith("qrxlg:"))
+async def qr_excel_one_group(callback: CallbackQuery) -> None:
+    if not callback.from_user or not is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        await callback.answer("Xato", show_alert=True)
+        return
+    try:
+        link_id = int(parts[1])
+        group_id = int(parts[2])
+    except ValueError:
+        await callback.answer("Xato", show_alert=True)
+        return
+    if not await db.get_link(link_id) or not await db.get_group(group_id):
+        await callback.answer("Ma'lumot topilmadi", show_alert=True)
+        return
+    promos = await db.list_promos_by_group(group_id)
+    if not promos:
+        await callback.answer("Guruhda promo yo'q", show_alert=True)
+        return
+    await callback.answer("Excel tayyorlanmoqda…")
+    if callback.message:
+        g = await db.get_group(group_id)
+        name = (g or {}).get("name") or ""
+        await _answer_tracking_excel(
+            callback.message,
+            link_id,
+            promos,
+            caption=f"📥 Guruhdagi promo havolalar — {name}",
+        )
 
 
 @router.callback_query(F.data.startswith("qbulk:"))
@@ -1021,6 +1776,49 @@ async def qr_all_promos_bulk(callback: CallbackQuery) -> None:
         except TelegramBadRequest:
             pass
         await _deliver_bulk_promo_qrs(callback.message, link_id, style)
+
+
+@router.callback_query(F.data.startswith("qallg:"))
+async def qr_all_promos_in_group_bulk(callback: CallbackQuery) -> None:
+    """Tanlangan link + guruh uchun barcha promo QR."""
+    if not callback.from_user or not is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+    parts = callback.data.split(":")
+    if len(parts) != 4 or parts[0] != "qallg":
+        await callback.answer("Xato", show_alert=True)
+        return
+    try:
+        link_id = int(parts[1])
+        group_id = int(parts[2])
+    except ValueError:
+        await callback.answer("Xato", show_alert=True)
+        return
+    mode = parts[3]
+    if not await db.get_link(link_id) or not await db.get_group(group_id):
+        await callback.answer("Ma'lumot topilmadi", show_alert=True)
+        return
+    if mode not in ("s", "r"):
+        await callback.answer()
+        if callback.message:
+            await _send_bulk_qr_style_prompt_group(
+                callback.message, link_id, group_id
+            )
+        return
+    style = "simple" if mode == "s" else "styled"
+    promos = await db.list_promos_by_group(group_id)
+    if not promos:
+        await callback.answer("Guruhda promo yo'q", show_alert=True)
+        return
+    await callback.answer("QRlar yuborilmoqda…")
+    if callback.message:
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except TelegramBadRequest:
+            pass
+        await _deliver_bulk_promo_qrs(
+            callback.message, link_id, style, group_id=group_id
+        )
 
 
 @router.callback_query(F.data.startswith("lg:"))
@@ -1081,7 +1879,7 @@ async def qr_pick_promo(callback: CallbackQuery) -> None:
             await callback.message.edit_reply_markup(reply_markup=None)
         except TelegramBadRequest:
             pass
-        await _send_qr_promo_pick(callback.message, link_id)
+        await _send_qr_group_pick(callback.message, link_id)
     await callback.answer()
 
 
@@ -1091,7 +1889,7 @@ async def qr_choose_style(callback: CallbackQuery) -> None:
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     parts = callback.data.split(":")
-    if len(parts) != 3:
+    if len(parts) not in (3, 4) or parts[0] != "qp":
         await callback.answer("Xato", show_alert=True)
         return
     try:
@@ -1100,6 +1898,17 @@ async def qr_choose_style(callback: CallbackQuery) -> None:
     except ValueError:
         await callback.answer("Xato", show_alert=True)
         return
+    if len(parts) == 4:
+        try:
+            group_id = int(parts[3])
+        except ValueError:
+            await callback.answer("Xato", show_alert=True)
+            return
+        back_cd = f"qrg:{link_id}:{group_id}"
+        back_txt = "◀️ Guruhdagi promolar"
+    else:
+        back_cd = f"qrgl:{link_id}"
+        back_txt = "◀️ Guruhlar"
 
     style_row = [
         InlineKeyboardButton(
@@ -1123,8 +1932,8 @@ async def qr_choose_style(callback: CallbackQuery) -> None:
                     style_row,
                     [
                         InlineKeyboardButton(
-                            text="◀️ Promo tanlash",
-                            callback_data=f"qr:bp:{link_id}",
+                            text=back_txt,
+                            callback_data=back_cd,
                         ),
                     ],
                     _row_menu(),
@@ -1181,7 +1990,7 @@ async def qr_build(callback: CallbackQuery) -> None:
         caption=(
             f"<b>Promo kod</b>: <code>{_h(promo_label)}</code>\n"
             f"<b>Uslub</b>: {uslub}\n"
-            f"<b>Havola</b>:\n<code>{_h(tracking_url)}</code>"
+            f"{_caption_tracking_link(tracking_url)}"
         ),
         parse_mode=ParseMode.HTML,
         reply_markup=_kb_menu_only(),
