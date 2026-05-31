@@ -140,7 +140,8 @@ async def init_db() -> None:
             CREATE TABLE IF NOT EXISTS promo_groups (
                 id BIGSERIAL PRIMARY KEY,
                 name TEXT NOT NULL UNIQUE,
-                created_at TIMESTAMPTZ NOT NULL
+                created_at TIMESTAMPTZ NOT NULL,
+                priority INTEGER NOT NULL DEFAULT 0
             );
             """
         )
@@ -184,8 +185,23 @@ async def _migrate_schema() -> None:
             CREATE TABLE IF NOT EXISTS promo_groups (
                 id BIGSERIAL PRIMARY KEY,
                 name TEXT NOT NULL UNIQUE,
-                created_at TIMESTAMPTZ NOT NULL
+                created_at TIMESTAMPTZ NOT NULL,
+                priority INTEGER NOT NULL DEFAULT 0
             );
+            """
+        )
+        await conn.execute(
+            "ALTER TABLE promo_groups ADD COLUMN IF NOT EXISTS priority INTEGER NOT NULL DEFAULT 0;"
+        )
+        await conn.execute(
+            """
+            UPDATE promo_groups g
+            SET priority = sub.rn
+            FROM (
+                SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS rn
+                FROM promo_groups
+            ) sub
+            WHERE g.id = sub.id AND g.priority = 0;
             """
         )
         await conn.execute(
@@ -340,8 +356,11 @@ async def add_group(name: str) -> int:
         async with _pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                INSERT INTO promo_groups (name, created_at)
-                VALUES ($1, $2)
+                INSERT INTO promo_groups (name, created_at, priority)
+                VALUES (
+                    $1, $2,
+                    COALESCE((SELECT MAX(priority) FROM promo_groups), 0) + 1
+                )
                 RETURNING id
                 """,
                 cleaned,
@@ -371,7 +390,11 @@ async def list_groups() -> list[dict[str, Any]]:
     assert _pool is not None
     async with _pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT id, name, created_at FROM promo_groups ORDER BY LOWER(name), id"
+            """
+            SELECT id, name, created_at, priority
+            FROM promo_groups
+            ORDER BY priority ASC, LOWER(name), id
+            """
         )
         return [_row(r) for r in rows]
 
@@ -380,7 +403,7 @@ async def get_group(group_id: int) -> dict[str, Any] | None:
     assert _pool is not None
     async with _pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT id, name, created_at FROM promo_groups WHERE id = $1",
+            "SELECT id, name, created_at, priority FROM promo_groups WHERE id = $1",
             group_id,
         )
         return _row(row) if row else None
@@ -732,19 +755,21 @@ async def stats_for_group(group_id: int) -> list[dict[str, Any]]:
 
 
 async def stats_summary_by_group() -> list[dict[str, Any]]:
-    """Barcha guruhlar bo'yicha promo kesimidagi jami yuklanishlar."""
+    """Barcha guruhlar bo'yicha promo kesimidagi jami yuklanishlar (prioritet tartibida)."""
     assert _pool is not None
     async with _pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT g.name AS group_name,
+            SELECT g.id AS group_id,
+                   g.name AS group_name,
+                   g.priority,
                    p.code AS promo_code,
                    COALESCE(SUM(t.clicks), 0)::bigint AS clicks
             FROM promos p
             JOIN promo_groups g ON g.id = p.group_id
             LEFT JOIN track_entries t ON t.promo_id = p.id
-            GROUP BY g.name, p.code
-            ORDER BY LOWER(g.name), LOWER(p.code)
+            GROUP BY g.id, g.name, g.priority, p.code
+            ORDER BY g.priority ASC, LOWER(g.name), LOWER(p.code)
             """
         )
         out: list[dict[str, Any]] = []
@@ -756,23 +781,26 @@ async def stats_summary_by_group() -> list[dict[str, Any]]:
 
 
 async def stats_group_totals_desc() -> list[dict[str, Any]]:
-    """Guruhlar bo'yicha jami yuklanishlar (kamayish tartibida)."""
+    """Guruhlar bo'yicha jami yuklanishlar (prioritet tartibida)."""
     assert _pool is not None
     async with _pool.acquire() as conn:
         rows = await conn.fetch(
             """
             SELECT g.name AS group_name,
+                   g.priority,
+                   COUNT(DISTINCT p.id)::bigint AS promo_count,
                    COALESCE(SUM(t.clicks), 0)::bigint AS clicks
             FROM promo_groups g
             LEFT JOIN promos p ON p.group_id = g.id
             LEFT JOIN track_entries t ON t.promo_id = p.id
-            GROUP BY g.name
-            ORDER BY COALESCE(SUM(t.clicks), 0) DESC, LOWER(g.name)
+            GROUP BY g.id, g.name, g.priority
+            ORDER BY g.priority ASC, LOWER(g.name)
             """
         )
         out: list[dict[str, Any]] = []
         for r in rows:
             d = _row(r)
             d["clicks"] = int(d["clicks"])
+            d["promo_count"] = int(d["promo_count"])
             out.append(d)
         return out

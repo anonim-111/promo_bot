@@ -3,6 +3,7 @@ import sqlite3
 from datetime import datetime
 from html import escape as html_escape
 from io import BytesIO
+from itertools import groupby
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -1235,7 +1236,10 @@ async def _send_stats_for_group_detail(message: Message, group_id: int) -> None:
         )
 
 
-def _build_stats_excel(rows: list[dict[str, object]]) -> bytes:
+def _build_stats_excel(
+    promo_rows: list[dict[str, object]],
+    group_rows: list[dict[str, object]],
+) -> bytes:
     wb = Workbook()
     ws = wb.active
     assert ws is not None
@@ -1243,24 +1247,62 @@ def _build_stats_excel(rows: list[dict[str, object]]) -> bytes:
     ws.append(["Guruh", "Promo kod", "Yuklanishlar"])
     for cell in ws[1]:
         cell.font = Font(bold=True)
-    total_clicks = 0
-    for row in rows:
-        clicks = int(row.get("clicks") or 0)
-        total_clicks += clicks
-        ws.append(
-            [
-                str(row.get("group_name") or ""),
-                str(row.get("promo_code") or ""),
-                clicks,
-            ]
-        )
-    ws.append([])
-    ws.append(["Jami", "", total_clicks])
+
+    grand_total = 0
+    for group_name, items in groupby(
+        promo_rows, key=lambda r: str(r.get("group_name") or "")
+    ):
+        group_sum = 0
+        for item in items:
+            clicks = int(item.get("clicks") or 0)
+            ws.append(
+                [
+                    group_name,
+                    str(item.get("promo_code") or ""),
+                    clicks,
+                ]
+            )
+            group_sum += clicks
+        ws.append([f"{group_name} jami", "", group_sum])
+        ws.cell(row=ws.max_row, column=1).font = Font(bold=True)
+        ws.cell(row=ws.max_row, column=3).font = Font(bold=True)
+        ws.append([])
+        grand_total += group_sum
+
+    ws.append(["Jami", "", grand_total])
     ws.cell(row=ws.max_row, column=1).font = Font(bold=True)
     ws.cell(row=ws.max_row, column=3).font = Font(bold=True)
     ws.column_dimensions["A"].width = 34
     ws.column_dimensions["B"].width = 40
     ws.column_dimensions["C"].width = 14
+
+    ws2 = wb.create_sheet("Guruhlar")
+    ws2.append(["Guruh", "Prioritet", "Promo soni", "Yuklanishlar"])
+    for cell in ws2[1]:
+        cell.font = Font(bold=True)
+    total_promos = 0
+    total_clicks = 0
+    for row in group_rows:
+        promo_count = int(row.get("promo_count") or 0)
+        clicks = int(row.get("clicks") or 0)
+        total_promos += promo_count
+        total_clicks += clicks
+        ws2.append(
+            [
+                str(row.get("group_name") or ""),
+                int(row.get("priority") or 0),
+                promo_count,
+                clicks,
+            ]
+        )
+    ws2.append(["Jami", "", total_promos, total_clicks])
+    ws2.cell(row=ws2.max_row, column=1).font = Font(bold=True)
+    ws2.cell(row=ws2.max_row, column=3).font = Font(bold=True)
+    ws2.cell(row=ws2.max_row, column=4).font = Font(bold=True)
+    ws2.column_dimensions["A"].width = 34
+    ws2.column_dimensions["B"].width = 12
+    ws2.column_dimensions["C"].width = 14
+    ws2.column_dimensions["D"].width = 14
 
     bio = BytesIO()
     wb.save(bio)
@@ -1309,10 +1351,11 @@ async def stats_export_excel(callback: CallbackQuery) -> None:
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     rows = await db.stats_summary_by_group()
+    group_rows = await db.stats_group_totals_desc()
     if not rows:
         await callback.answer("Statistika uchun ma'lumot yo'q", show_alert=True)
         return
-    content = _build_stats_excel(rows)
+    content = _build_stats_excel(rows, group_rows)
     filename = f"statistika_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
     file = BufferedInputFile(content, filename=filename)
     if callback.message:
@@ -1562,7 +1605,7 @@ async def _deliver_bulk_promo_qrs(
             else None,
         )
         if not last:
-            await asyncio.sleep(0.35)
+            await asyncio.sleep(1)
 
 
 @router.message(F.text == "📱 QR yaratish")
