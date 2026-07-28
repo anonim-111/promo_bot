@@ -30,6 +30,10 @@ RATE_LIMIT_ENABLED = os.getenv("RATE_LIMIT_ENABLED", "true").lower() in (
 RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "120"))
 RATE_LIMIT_WINDOW_SEC = float(os.getenv("RATE_LIMIT_WINDOW_SEC", "60"))
 
+# Cookie tozalangan/incognito holatlar uchun zaxira: shu soat ichida bir xil
+# IP+User-Agent'dan kelgan tashrif takroriy (dublikat) deb hisoblanadi.
+DEDUP_IP_UA_WINDOW_HOURS = float(os.getenv("DEDUP_IP_UA_WINDOW_HOURS", "24"))
+
 
 def _parse_hex_rgb(raw: str | None, default: tuple[int, int, int]) -> tuple[int, int, int]:
     if not raw:
