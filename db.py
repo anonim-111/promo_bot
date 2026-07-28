@@ -183,6 +183,12 @@ async def init_db() -> None:
             );
             """
         )
+        # Eski bazalarda jadval ip_ua_hash ustunisiz yaratilgan bo'lishi mumkin
+        # (CREATE TABLE IF NOT EXISTS uni qo'shmaydi) — shuning uchun indeksdan
+        # oldin har doim ALTER bilan mavjudligini ta'minlaymiz.
+        await conn.execute(
+            "ALTER TABLE track_visitors ADD COLUMN IF NOT EXISTS ip_ua_hash TEXT;"
+        )
         await conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_track_visitors_token ON track_visitors(token);"
         )
@@ -262,13 +268,6 @@ async def _migrate_schema() -> None:
         )
         await conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_promos_group_id ON promos(group_id);"
-        )
-        await conn.execute(
-            "ALTER TABLE track_visitors ADD COLUMN IF NOT EXISTS ip_ua_hash TEXT;"
-        )
-        await conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_track_visitors_ip_ua "
-            "ON track_visitors(token, ip_ua_hash, first_seen);"
         )
 
 
