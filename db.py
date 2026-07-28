@@ -171,6 +171,20 @@ async def init_db() -> None:
         await conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_track_token ON track_entries(token);"
         )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS track_visitors (
+                id BIGSERIAL PRIMARY KEY,
+                token TEXT NOT NULL,
+                visitor_id TEXT NOT NULL,
+                first_seen TIMESTAMPTZ NOT NULL,
+                UNIQUE(token, visitor_id)
+            );
+            """
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_track_visitors_token ON track_visitors(token);"
+        )
     await _migrate_schema()
 
 
@@ -670,6 +684,7 @@ async def get_link_url_by_token(token: str) -> str | None:
 
 
 async def increment_click(token: str) -> None:
+    """Eski, dedupsiz hisoblash (endi ishlatilmaydi — record_visit() ishlating)."""
     assert _pool is not None
     async with _pool.acquire() as conn:
         await conn.execute(
@@ -678,6 +693,35 @@ async def increment_click(token: str) -> None:
             """,
             token,
         )
+
+
+async def record_visit(token: str, visitor_id: str) -> bool:
+    """Tashrifni yozadi; bitta visitor_id bitta token uchun faqat bir marta hisoblanadi.
+
+    Qaytaradi: True — agar bu shu (token, visitor_id) uchun birinchi (unique) tashrif
+    bo'lsa (shu holda clicks +1 qilinadi), False — agar avval hisoblangan bo'lsa.
+    """
+    assert _pool is not None
+    async with _pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                """
+                INSERT INTO track_visitors (token, visitor_id, first_seen)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (token, visitor_id) DO NOTHING
+                RETURNING id
+                """,
+                token,
+                visitor_id,
+                _now_utc(),
+            )
+            is_new = row is not None
+            if is_new:
+                await conn.execute(
+                    "UPDATE track_entries SET clicks = clicks + 1 WHERE token = $1",
+                    token,
+                )
+    return is_new
 
 
 async def stats_summary() -> list[dict[str, Any]]:
