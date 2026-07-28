@@ -1,14 +1,28 @@
+import hashlib
 import secrets
 
 from aiohttp import web
 from yarl import URL
 
-from security_web import SlidingWindowRateLimiter, is_valid_track_token, rate_limit_middleware
+from security_web import (
+    SlidingWindowRateLimiter,
+    get_client_ip,
+    is_valid_track_token,
+    rate_limit_middleware,
+)
 
 # Bitta odam QR'ni bir necha bor skanerlasa ham bir marta hisoblash uchun
 # brauzerga qo'yiladigan tashrifchi cookie'si.
 VISITOR_COOKIE_NAME = "pb_vid"
 VISITOR_COOKIE_MAX_AGE = 60 * 60 * 24 * 365 * 2  # 2 yil
+
+
+def _ip_ua_hash(request: web.Request) -> str:
+    """Cookie o'chirilgan/incognito holatlar uchun zaxira imzo (IP + User-Agent)."""
+    ip = get_client_ip(request)
+    ua = request.headers.get("User-Agent", "")
+    raw = f"{ip}|{ua}".encode("utf-8", errors="ignore")
+    return hashlib.sha256(raw).hexdigest()
 
 
 async def health(request: web.Request) -> web.StreamResponse:
@@ -18,6 +32,7 @@ async def health(request: web.Request) -> web.StreamResponse:
 
 async def redirect_handler(request: web.Request) -> web.StreamResponse:
     import db
+    from config import DEDUP_IP_UA_WINDOW_HOURS
 
     token = request.match_info.get("token", "")
     if not is_valid_track_token(token):
@@ -31,7 +46,12 @@ async def redirect_handler(request: web.Request) -> web.StreamResponse:
     if is_first_cookie:
         visitor_id = secrets.token_urlsafe(16)
 
-    await db.record_visit(token, visitor_id)
+    await db.record_visit(
+        token,
+        visitor_id,
+        ip_ua_hash=_ip_ua_hash(request),
+        dedup_window_hours=DEDUP_IP_UA_WINDOW_HOURS,
+    )
 
     # Lotin bo'lmagan domen/yul uchun to'g'ri kodlangan Location
     response = web.HTTPFound(location=str(URL(target)))
