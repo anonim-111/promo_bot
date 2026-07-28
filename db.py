@@ -177,6 +177,7 @@ async def init_db() -> None:
                 id BIGSERIAL PRIMARY KEY,
                 token TEXT NOT NULL,
                 visitor_id TEXT NOT NULL,
+                ip_ua_hash TEXT,
                 first_seen TIMESTAMPTZ NOT NULL,
                 UNIQUE(token, visitor_id)
             );
@@ -184,6 +185,10 @@ async def init_db() -> None:
         )
         await conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_track_visitors_token ON track_visitors(token);"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_track_visitors_ip_ua "
+            "ON track_visitors(token, ip_ua_hash, first_seen);"
         )
     await _migrate_schema()
 
@@ -257,6 +262,13 @@ async def _migrate_schema() -> None:
         )
         await conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_promos_group_id ON promos(group_id);"
+        )
+        await conn.execute(
+            "ALTER TABLE track_visitors ADD COLUMN IF NOT EXISTS ip_ua_hash TEXT;"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_track_visitors_ip_ua "
+            "ON track_visitors(token, ip_ua_hash, first_seen);"
         )
 
 
@@ -695,33 +707,64 @@ async def increment_click(token: str) -> None:
         )
 
 
-async def record_visit(token: str, visitor_id: str) -> bool:
-    """Tashrifni yozadi; bitta visitor_id bitta token uchun faqat bir marta hisoblanadi.
+async def record_visit(
+    token: str,
+    visitor_id: str,
+    ip_ua_hash: str | None = None,
+    dedup_window_hours: float = 24.0,
+) -> bool:
+    """Tashrifni yozadi va dublikatni ikki imzo bilan tekshiradi:
 
-    Qaytaradi: True — agar bu shu (token, visitor_id) uchun birinchi (unique) tashrif
-    bo'lsa (shu holda clicks +1 qilinadi), False — agar avval hisoblangan bo'lsa.
+    1) visitor_id — cookie orqali (doimiy, cookie o'chirilmaguncha ishlaydi)
+    2) ip_ua_hash — IP + User-Agent hash (cookie/incognito holatlarda zaxira;
+       faqat oxirgi `dedup_window_hours` soat ichida tekshiriladi, chunki IP
+       vaqt o'tishi bilan boshqa odamga o'tishi mumkin)
+
+    Qaytaradi: True — bu unique (yangi) tashrif bo'lsa (clicks +1 qilinadi),
+    False — avval hisoblangan (takroriy) bo'lsa.
     """
     assert _pool is not None
     async with _pool.acquire() as conn:
         async with conn.transaction():
-            row = await conn.fetchrow(
+            existing = await conn.fetchrow(
                 """
-                INSERT INTO track_visitors (token, visitor_id, first_seen)
-                VALUES ($1, $2, $3)
-                ON CONFLICT (token, visitor_id) DO NOTHING
-                RETURNING id
+                SELECT id
+                FROM track_visitors
+                WHERE token = $1
+                  AND (
+                    visitor_id = $2
+                    OR (
+                        $3::text IS NOT NULL
+                        AND ip_ua_hash = $3
+                        AND first_seen > NOW() - ($4 * INTERVAL '1 hour')
+                    )
+                  )
+                LIMIT 1
                 """,
                 token,
                 visitor_id,
+                ip_ua_hash,
+                dedup_window_hours,
+            )
+            if existing is not None:
+                return False
+
+            await conn.execute(
+                """
+                INSERT INTO track_visitors (token, visitor_id, ip_ua_hash, first_seen)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (token, visitor_id) DO NOTHING
+                """,
+                token,
+                visitor_id,
+                ip_ua_hash,
                 _now_utc(),
             )
-            is_new = row is not None
-            if is_new:
-                await conn.execute(
-                    "UPDATE track_entries SET clicks = clicks + 1 WHERE token = $1",
-                    token,
-                )
-    return is_new
+            await conn.execute(
+                "UPDATE track_entries SET clicks = clicks + 1 WHERE token = $1",
+                token,
+            )
+    return True
 
 
 async def stats_summary() -> list[dict[str, Any]]:
