@@ -1,6 +1,7 @@
 import os
 import secrets
 import socket
+import ssl
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -90,20 +91,34 @@ def _use_explicit_pg_params() -> bool:
     return bool(os.getenv("SUPABASE_DB_HOST", "").strip()) and bool(_pg_password_explicit())
 
 
+def _supabase_ssl_context() -> ssl.SSLContext:
+    """Supabase/pooler: TLS shart, lekin ba'zi muhitlarda zanjir verify fail bo'ladi."""
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def _needs_supabase_ssl(host: str, port: int | None) -> bool:
+    h = (host or "").lower()
+    return "supabase" in h or port in {5432, 6543}
+
+
 async def _create_pool() -> asyncpg.Pool:
-    common = {"min_size": 1, "max_size": 10, "statement_cache_size": 0}
+    common: dict[str, Any] = {"min_size": 1, "max_size": 10, "statement_cache_size": 0}
     if _use_explicit_pg_params():
         host = os.getenv("SUPABASE_DB_HOST", "").strip()
         password = _pg_password_explicit()
         assert password is not None
+        port = int(os.getenv("SUPABASE_DB_PORT", "5432"))
         try:
             return await asyncpg.create_pool(
                 host=host,
-                port=int(os.getenv("SUPABASE_DB_PORT", "5432")),
+                port=port,
                 user=os.getenv("SUPABASE_DB_USER", "postgres").strip(),
                 password=password,
                 database=os.getenv("SUPABASE_DB_NAME", "postgres").strip(),
-                ssl=True,
+                ssl=_supabase_ssl_context() if _needs_supabase_ssl(host, port) else True,
                 **common,
             )
         except socket.gaierror as exc:
@@ -113,10 +128,10 @@ async def _create_pool() -> asyncpg.Pool:
 
     dsn = _dsn()
     parsed = urlparse(dsn)
-    kwargs: dict[str, Any] = dict(common)
-    host = (parsed.hostname or "").lower()
-    if "supabase" in host or parsed.port == 6543:
-        kwargs["ssl"] = True
+    kwargs = dict(common)
+    host = parsed.hostname or ""
+    if _needs_supabase_ssl(host, parsed.port):
+        kwargs["ssl"] = _supabase_ssl_context()
     try:
         return await asyncpg.create_pool(dsn, **kwargs)
     except socket.gaierror as exc:

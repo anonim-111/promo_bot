@@ -24,4 +24,4 @@ services:
       - key: TRUST_X_FORWARDED_FOR
         value: "true"
       - key: PYTHON_VERSION
-        value: 3.11.9
+        value: 3.13.9
