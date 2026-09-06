@@ -24,9 +24,31 @@ from config import (
 # token_urlsafe + qisqartirish; noto'g'ri format DB ga yetib bormasligi uchun
 TRACK_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{10,128}$")
 
+# Link preview / crawler — statistikaga kiritilmasin
+_BOT_UA_RE = re.compile(
+    r"("
+    r"TelegramBot|twitterbot|facebookexternalhit|Facebot|LinkedInBot|"
+    r"Slackbot|Discordbot|WhatsApp|SkypeUriPreview|"
+    r"Googlebot|bingbot|Baiduspider|YandexBot|DuckDuckBot|"
+    r"Applebot|Slurp|ia_archiver|SemrushBot|AhrefsBot|"
+    r"PetalBot|Bytespider|GPTBot|ClaudeBot|CCBot|"
+    r"HeadlessChrome|PhantomJS|curl/|wget/|python-requests|Go-http-client|"
+    r"http\.rb|Java/|libwww-perl|Scrapy"
+    r")",
+    re.IGNORECASE,
+)
+
 
 def is_valid_track_token(token: str) -> bool:
     return bool(token and TRACK_TOKEN_RE.fullmatch(token))
+
+
+def is_bot_or_crawler_ua(user_agent: str | None) -> bool:
+    """Preview bot / crawler UA — click hisoblanmasin."""
+    ua = (user_agent or "").strip()
+    if not ua:
+        return True
+    return bool(_BOT_UA_RE.search(ua))
 
 
 def get_client_ip(request: web.Request) -> str:

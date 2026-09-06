@@ -7,6 +7,7 @@ from yarl import URL
 from security_web import (
     SlidingWindowRateLimiter,
     get_client_ip,
+    is_bot_or_crawler_ua,
     is_valid_track_token,
     rate_limit_middleware,
 )
@@ -47,21 +48,25 @@ async def redirect_handler(request: web.Request) -> web.StreamResponse:
     if not target:
         raise web.HTTPNotFound(text="Link topilmadi")
 
+    ua = request.headers.get("User-Agent", "")
+    count_visit = not is_bot_or_crawler_ua(ua)
+
     visitor_id = request.cookies.get(VISITOR_COOKIE_NAME)
     is_first_cookie = visitor_id is None
-    if is_first_cookie:
+    if count_visit and is_first_cookie:
         visitor_id = secrets.token_urlsafe(16)
 
-    await db.record_visit(
-        token,
-        visitor_id,
-        ip_ua_hash=_ip_ua_hash(request),
-        dedup_window_hours=DEDUP_IP_UA_WINDOW_HOURS,
-    )
+    if count_visit and visitor_id:
+        await db.record_visit(
+            token,
+            visitor_id,
+            ip_ua_hash=_ip_ua_hash(request),
+            dedup_window_hours=DEDUP_IP_UA_WINDOW_HOURS,
+        )
 
     # Lotin bo'lmagan domen/yul uchun to'g'ri kodlangan Location
     response = web.HTTPFound(location=str(URL(target)))
-    if is_first_cookie:
+    if count_visit and is_first_cookie and visitor_id:
         from config import BASE_URL
 
         response.set_cookie(
