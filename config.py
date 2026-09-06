@@ -34,6 +34,14 @@ RATE_LIMIT_WINDOW_SEC = float(os.getenv("RATE_LIMIT_WINDOW_SEC", "60"))
 # IP+User-Agent'dan kelgan tashrif takroriy (dublikat) deb hisoblanadi.
 DEDUP_IP_UA_WINDOW_HOURS = float(os.getenv("DEDUP_IP_UA_WINDOW_HOURS", "24"))
 
+# track_visitors saqlash muddati (kun). 0 yoki manfiy = avtomatik tozalash o'chirilgan.
+# clicks track_entries da qoladi; faqat eski dedup yozuvlari o'chiriladi.
+TRACK_VISITORS_RETENTION_DAYS = int(os.getenv("TRACK_VISITORS_RETENTION_DAYS", "90"))
+# Tozalash qanchalik tez-tez ishlaydi (soat)
+TRACK_VISITORS_CLEANUP_INTERVAL_HOURS = float(
+    os.getenv("TRACK_VISITORS_CLEANUP_INTERVAL_HOURS", "24")
+)
+
 
 def _parse_hex_rgb(raw: str | None, default: tuple[int, int, int]) -> tuple[int, int, int]:
     if not raw:

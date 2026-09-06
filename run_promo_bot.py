@@ -8,8 +8,40 @@ from aiohttp import web
 
 import db
 from bot import get_dispatcher, make_bot
-from config import ADMIN_IDS, BOT_TOKEN, WEB_HOST, WEB_PORT
+from config import (
+    ADMIN_IDS,
+    BOT_TOKEN,
+    TRACK_VISITORS_CLEANUP_INTERVAL_HOURS,
+    TRACK_VISITORS_RETENTION_DAYS,
+    WEB_HOST,
+    WEB_PORT,
+)
 from web import create_app
+
+
+async def _visitors_cleanup_loop() -> None:
+    """Har N soatda 90+ kunlik track_visitors qatorlarini tozalaydi."""
+    days = TRACK_VISITORS_RETENTION_DAYS
+    if days < 1:
+        logging.info("track_visitors cleanup o'chirilgan (RETENTION_DAYS=%s)", days)
+        return
+    interval = max(1.0, TRACK_VISITORS_CLEANUP_INTERVAL_HOURS) * 3600
+    while True:
+        try:
+            deleted = await db.cleanup_old_visitors(days)
+            if deleted:
+                logging.info(
+                    "track_visitors cleanup: %s ta qator o'chirildi (>%s kun)",
+                    deleted,
+                    days,
+                )
+            else:
+                logging.debug("track_visitors cleanup: o'chirishga narsa yo'q")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.exception("track_visitors cleanup xatosi")
+        await asyncio.sleep(interval)
 
 
 async def main() -> None:
@@ -28,7 +60,8 @@ async def main() -> None:
             "Telegram ID ni .env ga qo'shing."
         )
 
-    # ── Avval web server ishga tushadi (Render port ko'rsin) ──
+    # ── Avval web port (Render /health), keyin DB, so'ng bot ──
+    # /r/ DB tayyor bo'lguncha 503 qaytaradi (web.redirect_handler).
     app = create_app()
     runner = web.AppRunner(app)
     await runner.setup()
@@ -36,17 +69,31 @@ async def main() -> None:
     await site.start()
     logging.info("Kuzatuv serveri: http://%s:%s/r/<token>", WEB_HOST, WEB_PORT)
 
-    # ── Keyin DB ulanadi ──
-    await db.init_db()
-
-    bot = make_bot()
-    dp = get_dispatcher()
-
+    cleanup_task: asyncio.Task | None = None
     try:
+        try:
+            await db.init_db()
+            logging.info("DB tayyor.")
+        except Exception:
+            logging.exception("DB ulanishi muvaffaqiyatsiz.")
+            raise
+
+        cleanup_task = asyncio.create_task(
+            _visitors_cleanup_loop(), name="track_visitors_cleanup"
+        )
+
+        bot = make_bot()
+        dp = get_dispatcher()
         await bot.delete_webhook(drop_pending_updates=True)
         logging.info("Polling boshlandi...")
         await dp.start_polling(bot, handle_signals=True)
     finally:
+        if cleanup_task is not None:
+            cleanup_task.cancel()
+            try:
+                await cleanup_task
+            except asyncio.CancelledError:
+                pass
         try:
             await site.stop()
         except Exception:
@@ -55,10 +102,17 @@ async def main() -> None:
             await runner.cleanup()
         except Exception:
             logging.exception("runner.cleanup() xatosi")
+        try:
+            await db.close_pool()
+        except Exception:
+            logging.exception("db.close_pool() xatosi")
         logging.info("Kuzatuv serveri va bot sessiyasi yopildi.")
 
 
 if __name__ == "__main__":
     if sys.platform == "win32":
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        try:
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        except AttributeError:
+            pass
     asyncio.run(main())

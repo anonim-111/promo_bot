@@ -6,3 +6,11 @@ __pycache__/
 *.egg-info/
 .idea/
 data/
+# Bir martalik/temp / dump
+_check_*.py
+_fix_*.py
+_*.txt
+*.dump
+*.sql
+*.sql.bak
+migrate_*.py

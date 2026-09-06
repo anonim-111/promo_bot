@@ -92,20 +92,33 @@ def render_tracking_qr_png(
     return buf.getvalue()
 
 
-def excel_inline_qr_png(url: str, *, box_size: int = 4) -> bytes:
+def excel_inline_qr_png(url: str, *, box_size: int = 2) -> bytes:
     """
-    Excelga joylash uchun kichik oq-qora QR (logo va rangsiz) — tez generatsiya.
-    ERROR_CORRECT_L + kichik box_size.
+    Excelga joylash uchun kichik oq-qora QR (logo va rangsiz).
+    Pixel/modul butun son — resize qilinmaydi (skaner uchun muhim).
+    border=2 + ERROR_CORRECT_M; version=4 tezkor, sig'masa fit=True.
     """
     qr = qrcode.QRCode(
-        version=None,
-        error_correction=ERROR_CORRECT_L,
+        version=4,
+        error_correction=ERROR_CORRECT_M,
         box_size=box_size,
-        border=1,
+        border=2,
     )
     qr.add_data(url)
-    qr.make(fit=True)
+    try:
+        qr.make(fit=False)
+    except Exception:
+        # DataOverflowError (version=4 ga sig'masa) yoki boshqa fit xatosi
+        qr = qrcode.QRCode(
+            version=None,
+            error_correction=ERROR_CORRECT_M,
+            box_size=box_size,
+            border=2,
+        )
+        qr.add_data(url)
+        qr.make(fit=True)
     img = qr.make_image(fill_color="black", back_color="white")
     buf = io.BytesIO()
-    img.save(buf, format="PNG")
+    # compress_level past → yozish tezroq (fayl biroz kattaroq)
+    img.save(buf, format="PNG", compress_level=1)
     return buf.getvalue()

@@ -34,6 +34,12 @@ async def redirect_handler(request: web.Request) -> web.StreamResponse:
     import db
     from config import DEDUP_IP_UA_WINDOW_HOURS
 
+    if not db.is_ready():
+        raise web.HTTPServiceUnavailable(
+            text="Server ishga tushmoqda, birozdan keyin qayta urinib ko'ring.",
+            headers={"Retry-After": "3"},
+        )
+
     token = request.match_info.get("token", "")
     if not is_valid_track_token(token):
         raise web.HTTPNotFound(text="Link topilmadi")
@@ -56,12 +62,15 @@ async def redirect_handler(request: web.Request) -> web.StreamResponse:
     # Lotin bo'lmagan domen/yul uchun to'g'ri kodlangan Location
     response = web.HTTPFound(location=str(URL(target)))
     if is_first_cookie:
+        from config import BASE_URL
+
         response.set_cookie(
             VISITOR_COOKIE_NAME,
             visitor_id,
             max_age=VISITOR_COOKIE_MAX_AGE,
             httponly=True,
             samesite="Lax",
+            secure=BASE_URL.lower().startswith("https://"),
         )
     raise response
 
