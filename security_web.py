@@ -24,14 +24,25 @@ from config import (
 # token_urlsafe + qisqartirish; noto'g'ri format DB ga yetib bormasligi uchun
 TRACK_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{10,128}$")
 
-# Link preview / crawler — statistikaga kiritilmasin
+# Link preview / crawler / uptime / AI — statistikaga kiritilmasin
+# Eslatma: okhttp va yalang "bot" qo'shilmagan (real Android klientlar xavfi).
 _BOT_UA_RE = re.compile(
     r"("
+    # Ijtimoiy / link-preview
     r"TelegramBot|twitterbot|facebookexternalhit|Facebot|LinkedInBot|"
     r"Slackbot|Discordbot|WhatsApp|SkypeUriPreview|"
-    r"Googlebot|bingbot|Baiduspider|YandexBot|DuckDuckBot|"
+    r"Pinterest|VKShare|vkShare|"
+    # Qidiruv / AI
+    r"Googlebot|Google-Read-Aloud|bingbot|Baiduspider|YandexBot|DuckDuckBot|"
     r"Applebot|Slurp|ia_archiver|SemrushBot|AhrefsBot|"
-    r"PetalBot|Bytespider|GPTBot|ClaudeBot|CCBot|"
+    r"PetalBot|Bytespider|"
+    r"GPTBot|ChatGPT-User|OAI-SearchBot|"
+    r"ClaudeBot|Claude-Web|PerplexityBot|CCBot|"
+    # Monitoring / uptime
+    r"Pingdom|StatusCake|Site24x7|"
+    # QR / scanner ilovalari (aniq nomlar)
+    r"QR\s*Scanner|ZXing|"
+    # Skript / headless
     r"HeadlessChrome|PhantomJS|curl/|wget/|python-requests|Go-http-client|"
     r"http\.rb|Java/|libwww-perl|Scrapy"
     r")",

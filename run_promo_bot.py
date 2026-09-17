@@ -2,9 +2,11 @@
 
 import asyncio
 import logging
+import os
 import sys
 
 from aiohttp import web
+from aiogram.exceptions import TelegramConflictError
 
 import db
 from bot import get_dispatcher, make_bot
@@ -17,6 +19,10 @@ from config import (
     WEB_PORT,
 )
 from web import create_app
+
+# Render deploy: yangi instance eski hali getUpdates qilayotganda Conflict chiqadi.
+# Eski jarayon SIGTERM olishi uchun polling oldidan qisqa kutish.
+POLLING_START_DELAY_SEC = float(os.getenv("POLLING_START_DELAY_SEC", "5"))
 
 
 async def _visitors_cleanup_loop() -> None:
@@ -42,6 +48,30 @@ async def _visitors_cleanup_loop() -> None:
         except Exception:
             logging.exception("track_visitors cleanup xatosi")
         await asyncio.sleep(interval)
+
+
+async def _start_polling_with_conflict_guard(dp, bot) -> None:
+    """Bitta instance polling; Conflict bo'lsa qisqa kutib qayta urinadi."""
+    await bot.delete_webhook(drop_pending_updates=True)
+    if POLLING_START_DELAY_SEC > 0:
+        logging.info(
+            "Polling oldidan %.0fs kutish (boshqa instance tugashi uchun)...",
+            POLLING_START_DELAY_SEC,
+        )
+        await asyncio.sleep(POLLING_START_DELAY_SEC)
+        await bot.delete_webhook(drop_pending_updates=True)
+
+    logging.info("Polling boshlandi...")
+    try:
+        await dp.start_polling(bot, handle_signals=True, close_bot_session=False)
+    except TelegramConflictError:
+        logging.error(
+            "Telegram Conflict: boshqa joyda ham shu BOT_TOKEN bilan polling bor "
+            "(lokal + Render, yoki eski deploy). 15s kutib qayta uriniladi..."
+        )
+        await asyncio.sleep(15)
+        await bot.delete_webhook(drop_pending_updates=True)
+        await dp.start_polling(bot, handle_signals=True, close_bot_session=False)
 
 
 async def main() -> None:
@@ -70,6 +100,7 @@ async def main() -> None:
     logging.info("Kuzatuv serveri: http://%s:%s/r/<token>", WEB_HOST, WEB_PORT)
 
     cleanup_task: asyncio.Task | None = None
+    bot = None
     try:
         try:
             await db.init_db()
@@ -84,9 +115,7 @@ async def main() -> None:
 
         bot = make_bot()
         dp = get_dispatcher()
-        await bot.delete_webhook(drop_pending_updates=True)
-        logging.info("Polling boshlandi...")
-        await dp.start_polling(bot, handle_signals=True)
+        await _start_polling_with_conflict_guard(dp, bot)
     finally:
         if cleanup_task is not None:
             cleanup_task.cancel()
@@ -94,6 +123,11 @@ async def main() -> None:
                 await cleanup_task
             except asyncio.CancelledError:
                 pass
+        if bot is not None:
+            try:
+                await bot.session.close()
+            except Exception:
+                logging.exception("bot.session.close() xatosi")
         try:
             await site.stop()
         except Exception:

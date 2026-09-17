@@ -23,5 +23,7 @@ services:
         value: 10000
       - key: TRUST_X_FORWARDED_FOR
         value: "true"
+      - key: POLLING_START_DELAY_SEC
+        value: "5"
       - key: PYTHON_VERSION
         value: 3.13.9
