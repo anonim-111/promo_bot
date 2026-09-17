@@ -14,8 +14,6 @@ WEB_PORT = int(os.getenv("WEB_PORT") or os.getenv("PORT", "8080"))
 # Telegram API so'rovlari (long polling) uchun sekundlarda; tarmoq sekin bo'lsa oshiring
 TELEGRAM_HTTP_TIMEOUT = float(os.getenv("TELEGRAM_HTTP_TIMEOUT", "120"))
 
-# --- Kuzatuv serveri (/r/...) xavfsizligi ---
-# True bo'lsa, nginx/caddy orqasida birinchi proxy X-Forwarded-For ga ishonadi
 TRUST_X_FORWARDED_FOR = os.getenv("TRUST_X_FORWARDED_FOR", "false").lower() in (
     "1",
     "true",
@@ -26,18 +24,12 @@ RATE_LIMIT_ENABLED = os.getenv("RATE_LIMIT_ENABLED", "true").lower() in (
     "true",
     "yes",
 )
-# Har bir IP uchun maksimal so'rovlar (sliding window ichida)
 RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "120"))
 RATE_LIMIT_WINDOW_SEC = float(os.getenv("RATE_LIMIT_WINDOW_SEC", "60"))
 
-# Cookie tozalangan/incognito holatlar uchun zaxira: shu soat ichida bir xil
-# IP+User-Agent'dan kelgan tashrif takroriy (dublikat) deb hisoblanadi.
 DEDUP_IP_UA_WINDOW_HOURS = float(os.getenv("DEDUP_IP_UA_WINDOW_HOURS", "24"))
 
-# track_visitors saqlash muddati (kun). 0 yoki manfiy = avtomatik tozalash o'chirilgan.
-# clicks track_entries da qoladi; faqat eski dedup yozuvlari o'chiriladi.
 TRACK_VISITORS_RETENTION_DAYS = int(os.getenv("TRACK_VISITORS_RETENTION_DAYS", "90"))
-# Tozalash qanchalik tez-tez ishlaydi (soat)
 TRACK_VISITORS_CLEANUP_INTERVAL_HOURS = float(
     os.getenv("TRACK_VISITORS_CLEANUP_INTERVAL_HOURS", "24")
 )

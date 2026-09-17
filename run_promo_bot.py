@@ -20,7 +20,7 @@ from web import create_app
 
 
 async def _visitors_cleanup_loop() -> None:
-    """Har N soatda 90+ kunlik track_visitors qatorlarini tozalaydi."""
+    """Har N soatda retention dan eski track_visitors qatorlarini tozalaydi."""
     days = TRACK_VISITORS_RETENTION_DAYS
     if days < 1:
         logging.info("track_visitors cleanup o'chirilgan (RETENTION_DAYS=%s)", days)

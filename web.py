@@ -12,8 +12,6 @@ from security_web import (
     rate_limit_middleware,
 )
 
-# Bitta odam QR'ni bir necha bor skanerlasa ham bir marta hisoblash uchun
-# brauzerga qo'yiladigan tashrifchi cookie'si.
 VISITOR_COOKIE_NAME = "pb_vid"
 VISITOR_COOKIE_MAX_AGE = 60 * 60 * 24 * 365 * 2  # 2 yil
 

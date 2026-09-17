@@ -2,6 +2,7 @@ import os
 import secrets
 import socket
 import ssl
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -153,6 +154,227 @@ def is_ready() -> bool:
     return _pool is not None
 
 
+_VISITOR_MIGRATE_BATCH = 20_000
+_VISITOR_STATEMENT_TIMEOUT_MS = 600_000  # 10 daqiqa
+
+
+async def _set_statement_timeout(
+    conn: asyncpg.Connection, timeout_ms: int = _VISITOR_STATEMENT_TIMEOUT_MS
+) -> None:
+    await conn.execute(f"SET statement_timeout = {_safe_timeout_ms(timeout_ms)}")
+
+
+def _safe_timeout_ms(timeout_ms: int) -> int:
+    return max(1_000, int(timeout_ms))
+
+
+async def _dedupe_visitors_before_unique(
+    conn: asyncpg.Connection,
+    *,
+    batch_size: int = _VISITOR_MIGRATE_BATCH,
+) -> int:
+    """UNIQUE(link_id, visitor_id) dan oldin ortiqcha qatorlarni o'chiradi.
+
+    clicks o'zgarmaydi. Faqat migratsiya ichida chaqiriladi.
+    """
+    total_deleted = 0
+    while True:
+        async with conn.transaction():
+            extras = await conn.fetch(
+                """
+                WITH ranked AS (
+                    SELECT
+                        tv.id,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY COALESCE(tv.link_id, te.link_id), tv.visitor_id
+                            ORDER BY tv.first_seen ASC, tv.id ASC
+                        ) AS rn
+                    FROM track_visitors tv
+                    JOIN track_entries te ON te.token = tv.token
+                )
+                SELECT id FROM ranked WHERE rn > 1
+                LIMIT $1
+                """,
+                batch_size,
+            )
+            if not extras:
+                break
+            ids = [int(row["id"]) for row in extras]
+            deleted = await conn.execute(
+                "DELETE FROM track_visitors WHERE id = ANY($1::bigint[])",
+                ids,
+            )
+            n = int(deleted.split()[-1]) if deleted else 0
+            total_deleted += n
+            if n < batch_size:
+                break
+    return total_deleted
+
+
+async def _drop_track_visitors_unique_guards(conn: asyncpg.Connection) -> None:
+    """Backfill oldidan unique cheklovlarni olib tashlash."""
+    await conn.execute("DROP INDEX IF EXISTS uq_track_visitors_link_visitor")
+    await conn.execute(
+        """
+        DO $$
+        DECLARE
+            r RECORD;
+        BEGIN
+            FOR r IN
+                SELECT c.conname
+                FROM pg_constraint c
+                WHERE c.conrelid = 'public.track_visitors'::regclass
+                  AND c.contype = 'u'
+                  AND (
+                    pg_get_constraintdef(c.oid) LIKE '%(token, visitor_id)%'
+                    OR pg_get_constraintdef(c.oid) LIKE '%(link_id, visitor_id)%'
+                  )
+            LOOP
+                EXECUTE format(
+                    'ALTER TABLE track_visitors DROP CONSTRAINT %I',
+                    r.conname
+                );
+            END LOOP;
+        END $$;
+        """
+    )
+
+
+async def _ensure_track_visitors_link_id(conn: asyncpg.Connection) -> None:
+    """link_id ustuni + batch backfill (unique yo'qligida chaqiriladi)."""
+    # FK siz — katta jadvalda ALTER tezroq / kamroq lock
+    await conn.execute(
+        """
+        ALTER TABLE track_visitors
+        ADD COLUMN IF NOT EXISTS link_id BIGINT
+        """
+    )
+    while True:
+        status = await conn.execute(
+            """
+            UPDATE track_visitors tv
+            SET link_id = te.link_id
+            FROM track_entries te
+            WHERE tv.token = te.token
+              AND tv.link_id IS NULL
+              AND tv.id IN (
+                  SELECT id FROM track_visitors
+                  WHERE link_id IS NULL
+                  LIMIT $1
+              )
+            """,
+            _VISITOR_MIGRATE_BATCH,
+        )
+        # "UPDATE N"
+        updated = int(status.split()[-1]) if status else 0
+        if updated == 0:
+            break
+        logging.info("track_visitors link_id backfill: +%s", updated)
+
+
+async def _migrate_track_visitors_link_scope(conn: asyncpg.Connection) -> None:
+    """link_id backfill, dublikatlarni siqish, UNIQUE(link_id, visitor_id).
+
+    Tartib: kerak bo'lsa unique DROP → backfill → dedupe → unique CREATE.
+    Allaqachon tayyor bo'lsa unique ni har start da o'chirmaydi.
+    clicks o'zgarmaydi.
+    """
+    await _set_statement_timeout(conn)
+    await conn.execute(
+        "ALTER TABLE track_visitors ADD COLUMN IF NOT EXISTS link_id BIGINT"
+    )
+
+    nulls = int(
+        await conn.fetchval(
+            "SELECT COUNT(*) FROM track_visitors WHERE link_id IS NULL"
+        )
+        or 0
+    )
+    has_link_uq = bool(
+        await conn.fetchval(
+            """
+            SELECT 1 FROM pg_indexes
+            WHERE schemaname = 'public'
+              AND indexname = 'uq_track_visitors_link_visitor'
+            """
+        )
+    )
+
+    if nulls == 0 and has_link_uq:
+        # Eski (token, visitor_id) unique qolgan bo'lsa — faqat uni olib tashlash
+        await conn.execute(
+            """
+            DO $$
+            DECLARE
+                r RECORD;
+            BEGIN
+                FOR r IN
+                    SELECT c.conname
+                    FROM pg_constraint c
+                    WHERE c.conrelid = 'public.track_visitors'::regclass
+                      AND c.contype = 'u'
+                      AND pg_get_constraintdef(c.oid) LIKE '%(token, visitor_id)%'
+                LOOP
+                    EXECUTE format(
+                        'ALTER TABLE track_visitors DROP CONSTRAINT %I',
+                        r.conname
+                    );
+                END LOOP;
+            END $$;
+            """
+        )
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_track_visitors_link_ip_ua
+            ON track_visitors (link_id, ip_ua_hash, first_seen)
+            """
+        )
+        try:
+            await conn.execute(
+                "ALTER TABLE track_visitors ALTER COLUMN link_id SET NOT NULL"
+            )
+        except Exception:
+            logging.debug("link_id SET NOT NULL skip", exc_info=True)
+        return
+
+    await _drop_track_visitors_unique_guards(conn)
+    await _ensure_track_visitors_link_id(conn)
+
+    orphans = await conn.execute(
+        "DELETE FROM track_visitors WHERE link_id IS NULL"
+    )
+    orphan_n = int(orphans.split()[-1]) if orphans else 0
+    if orphan_n:
+        logging.info("track_visitors orphan rows deleted: %s", orphan_n)
+
+    deleted = await _dedupe_visitors_before_unique(conn)
+    if deleted:
+        logging.info(
+            "track_visitors dedupe before unique: deleted=%s (clicks unchanged)",
+            deleted,
+        )
+
+    await conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_track_visitors_link_visitor
+        ON track_visitors (link_id, visitor_id)
+        """
+    )
+    await conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_track_visitors_link_ip_ua
+        ON track_visitors (link_id, ip_ua_hash, first_seen)
+        """
+    )
+    nulls_left = await conn.fetchval(
+        "SELECT COUNT(*) FROM track_visitors WHERE link_id IS NULL"
+    )
+    if nulls_left == 0:
+        await conn.execute(
+            "ALTER TABLE track_visitors ALTER COLUMN link_id SET NOT NULL"
+        )
+
+
 async def init_db() -> None:
     global _pool
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -237,12 +459,18 @@ async def init_db() -> None:
                 visitor_id TEXT NOT NULL,
                 ip_ua_hash TEXT,
                 first_seen TIMESTAMPTZ NOT NULL,
-                UNIQUE (token, visitor_id)
+                link_id BIGINT
             );
             """
         )
         await conn.execute(
             "ALTER TABLE track_visitors ADD COLUMN IF NOT EXISTS ip_ua_hash TEXT;"
+        )
+        await conn.execute(
+            """
+            ALTER TABLE track_visitors
+            ADD COLUMN IF NOT EXISTS link_id BIGINT;
+            """
         )
         await conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_track_visitors_token ON track_visitors(token);"
@@ -256,6 +484,8 @@ async def init_db() -> None:
         await conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_track_visitors_first_seen ON track_visitors(first_seen);"
         )
+        # Bir link + bir visitor = bitta yozuv (eski token-level unique o'rniga)
+        await _migrate_track_visitors_link_scope(conn)
         await conn.execute(
             "ALTER TABLE links ADD COLUMN IF NOT EXISTS logo_path TEXT;"
         )
@@ -945,13 +1175,25 @@ async def record_visit(
     ip_ua_hash: str | None = None,
     dedup_window_hours: float = 24.0,
 ) -> bool:
+    """Bir link ichida bir visitor (cookie / IP+UA) faqat bir marta hisoblanadi.
+
+    First-touch: birinchi skanlangan promo tokeniga clicks +1.
+    Bir xil linkdagi boshqa promo QR lar hisoblanmaydi.
+    """
     assert _pool is not None
     async with _pool.acquire() as conn:
         async with conn.transaction():
+            link_id = await conn.fetchval(
+                "SELECT link_id FROM track_entries WHERE token = $1",
+                token,
+            )
+            if link_id is None:
+                return False
+
             existing = await conn.fetchrow(
                 """
                 SELECT id FROM track_visitors
-                WHERE token = $1
+                WHERE link_id = $1
                   AND (
                     visitor_id = $2
                     OR (
@@ -962,25 +1204,28 @@ async def record_visit(
                   )
                 LIMIT 1
                 """,
-                token,
+                link_id,
                 visitor_id,
                 ip_ua_hash,
                 dedup_window_hours,
             )
             if existing is not None:
                 return False
-            status = await conn.execute(
-                """
-                INSERT INTO track_visitors (token, visitor_id, ip_ua_hash, first_seen)
-                VALUES ($1, $2, $3, $4)
-                ON CONFLICT (token, visitor_id) DO NOTHING
-                """,
-                token,
-                visitor_id,
-                ip_ua_hash,
-                _now_utc(),
-            )
-            if status.endswith("0"):
+            try:
+                await conn.execute(
+                    """
+                    INSERT INTO track_visitors
+                        (token, link_id, visitor_id, ip_ua_hash, first_seen)
+                    VALUES ($1, $2, $3, $4, $5)
+                    """,
+                    token,
+                    link_id,
+                    visitor_id,
+                    ip_ua_hash,
+                    _now_utc(),
+                )
+            except UniqueViolationError:
+                # Unique index bor: parallel so'rov yoki migratsiya oynasi
                 return False
             await conn.execute(
                 "UPDATE track_entries SET clicks = clicks + 1 WHERE token = $1",
@@ -989,13 +1234,15 @@ async def record_visit(
             return True
 
 
-async def cleanup_old_visitors(days: int = 90, *, batch_size: int = 5000) -> int:
+async def cleanup_old_visitors(days: int = 90, *, batch_size: int = 20_000) -> int:
+    """Eski track_visitors qatorlarini o'chiradi; clicks saqlanadi."""
     if days < 1:
         return 0
     batch_size = max(batch_size, 1)
     assert _pool is not None
     total = 0
     async with _pool.acquire() as conn:
+        await _set_statement_timeout(conn)
         while True:
             rows = await conn.fetch(
                 """
