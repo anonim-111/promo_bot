@@ -86,8 +86,8 @@ async def main() -> None:
 
     if not ADMIN_IDS:
         logging.warning(
-            "ADMIN_IDS bo'sh — hech kim botni boshqara olmaydi. "
-            "Telegram ID ni .env ga qo'shing."
+            "ADMIN_IDS bo'sh — super-admin yo'q. "
+            "Telegram ID ni .env ga qo'shing (faqat env orqali)."
         )
 
     # ── Avval web port (Render /health), keyin DB, so'ng bot ──

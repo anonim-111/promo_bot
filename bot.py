@@ -12,7 +12,7 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
@@ -21,12 +21,23 @@ from aiogram.types import (
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
 )
 from openpyxl import Workbook
 from openpyxl.styles import Font
 
+import access
 import db
-from config import BASE_URL, BOT_TOKEN, TELEGRAM_HTTP_TIMEOUT, is_admin
+from access import (
+    can_access_category,
+    can_access_group,
+    can_manage,
+    can_manage_users,
+    can_view_stats,
+    category_scope,
+    get_role,
+)
+from config import BASE_URL, BOT_TOKEN, TELEGRAM_HTTP_TIMEOUT, is_super_admin
 from db import DuplicateError
 from link_logo import download_and_save_link_logo
 from qr_image import excel_inline_qr_png, render_tracking_qr_png
@@ -43,6 +54,7 @@ BTN_STATS = "📊 Statistikani ko'rish"
 BTN_ADD_CATEGORY = "🏛 Yangi kategoriya"
 BTN_ADD_GROUP = "📁 Yangi guruh"
 BTN_CATEGORIES = "🏛 Kategoriyani boshqarish"
+BTN_USERS = "👥 Foydalanuvchilar"
 
 # FSM ichida /buyruq va menyuga chiqish uchun
 MAIN_MENU_TEXTS = frozenset(
@@ -56,6 +68,7 @@ MAIN_MENU_TEXTS = frozenset(
         BTN_ADD_CATEGORY,
         BTN_ADD_GROUP,
         BTN_CATEGORIES,
+        BTN_USERS,
     }
 )
 
@@ -131,7 +144,7 @@ async def _cb_noop(callback: CallbackQuery) -> None:
 
 
 def main_kb() -> ReplyKeyboardMarkup:
-    """Asosiy pastki menyu — 3 ustun."""
+    """Admin pastki menyu — 3 ustun."""
     return ReplyKeyboardMarkup(
         keyboard=[
             [
@@ -152,6 +165,39 @@ def main_kb() -> ReplyKeyboardMarkup:
         ],
         resize_keyboard=True,
     )
+
+
+def viewer_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=BTN_STATS)]],
+        resize_keyboard=True,
+    )
+
+
+def super_kb() -> ReplyKeyboardMarkup:
+    kb = main_kb()
+    rows = list(kb.keyboard)
+    rows.append([KeyboardButton(text=BTN_USERS)])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+
+async def reply_kb_for(
+    user_id: int,
+) -> ReplyKeyboardMarkup | ReplyKeyboardRemove:
+    role = await get_role(user_id)
+    if role == access.ROLE_SUPER:
+        return super_kb()
+    if role == access.ROLE_ADMIN:
+        return main_kb()
+    if role == access.ROLE_VIEWER:
+        return viewer_kb()
+    return ReplyKeyboardRemove()
+
+
+async def _kb(message: Message) -> ReplyKeyboardMarkup | ReplyKeyboardRemove:
+    if message.from_user:
+        return await reply_kb_for(message.from_user.id)
+    return ReplyKeyboardRemove()
 
 
 class AddLinkStates(StatesGroup):
@@ -192,6 +238,11 @@ class EditCategoryStates(StatesGroup):
 
 class EditGroupNameStates(StatesGroup):
     waiting_name = State()
+
+
+class UserManageStates(StatesGroup):
+    waiting_admin_id = State()
+    waiting_viewer_id = State()
 
 
 def _is_valid_http_url(url: str) -> bool:
@@ -915,17 +966,38 @@ async def _send_promos_in_group(
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
-    if not message.from_user or not is_admin(message.from_user.id):
-        await message.answer("Bu bot faqat administratorlar uchun.")
+    if not message.from_user:
         return
-    await message.answer("Salom!", reply_markup=main_kb())
+    role = await get_role(message.from_user.id)
+    if role is None:
+        await message.answer("Bu bot faqat ruxsat berilgan foydalanuvchilar uchun.")
+        return
+    kb = await reply_kb_for(message.from_user.id)
+    if role == access.ROLE_VIEWER:
+        await message.answer(
+            "Salom! Statistikani ko'rishingiz va Excel yuklab olishingiz mumkin.",
+            reply_markup=kb,
+        )
+    else:
+        await message.answer("Salom!", reply_markup=kb)
 
 
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
-    if not message.from_user or not is_admin(message.from_user.id):
+    if not message.from_user:
         return
-    await message.answer(
+    role = await get_role(message.from_user.id)
+    if role is None:
+        return
+    if role == access.ROLE_VIEWER:
+        await message.answer(
+            f"<b>{BTN_STATS}</b> — sizga biriktirilgan kategoriyalar bo'yicha "
+            "statistika va Excel export.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_kb_menu_only(),
+        )
+        return
+    help_text = (
         f"1) Avval <b>{BTN_ADD_LINK}</b> va <b>{BTN_ADD_PROMO}</b> bilan boshlang.\n"
         f"2) <b>{BTN_ADD_CATEGORY}</b> — yangi kategoriya yaratish.\n"
         f"3) <b>{BTN_CATEGORIES}</b> — tartib (⬆️⬇️), nomini o'zgartirish, "
@@ -936,8 +1008,15 @@ async def cmd_help(message: Message) -> None:
         f"6) <b>{BTN_STATS}</b> — kategoriya/guruh va yuklanishlar, Excel export.\n"
         f"7) Har bir link uchun QR markazidagi logotip — link qo'shganda yoki "
         f"<b>{BTN_LINKS}</b> → link kartochkasidagi <b>Logotipni almashtirish</b>.\n"
-        f"8) <b>{BTN_LINKS}</b> — tahrir, logotip va o'chirish ham shu yerda.\n\n"
-        f"Tracking URL ko'rinishi: <code>{_h(BASE_URL)}/r/token</code>",
+        f"8) <b>{BTN_LINKS}</b> — tahrir, logotip va o'chirish ham shu yerda.\n"
+    )
+    if role == access.ROLE_SUPER:
+        help_text += (
+            f"9) <b>{BTN_USERS}</b> — admin/viewer qo'shish (super faqat env'da).\n"
+        )
+    help_text += f"\nTracking URL ko'rinishi: <code>{_h(BASE_URL)}/r/token</code>"
+    await message.answer(
+        help_text,
         parse_mode=ParseMode.HTML,
         reply_markup=_kb_menu_only(),
     )
@@ -945,33 +1024,47 @@ async def cmd_help(message: Message) -> None:
 
 @router.message(Command("cancel"))
 async def cancel(message: Message, state: FSMContext) -> None:
-    if _deny(message):
+    if not message.from_user or not await can_view_stats(message.from_user.id):
         return
     await state.clear()
-    await message.answer("Bekor qilindi.", reply_markup=main_kb())
+    kb = await reply_kb_for(message.from_user.id)
+    await message.answer("Bekor qilindi.", reply_markup=kb)
 
 
-def _deny(message: Message) -> bool:
-    if message.from_user and is_admin(message.from_user.id):
+async def _deny_manage(message: Message) -> bool:
+    """True = ruxsat yo'q (boshqaruv buyruqlari uchun)."""
+    if message.from_user and await can_manage(message.from_user.id):
+        return False
+    if message.from_user and await can_view_stats(message.from_user.id):
+        # Eski admin klaviaturasi qolgan viewer uchun tushunarli javob
+        await message.answer(
+            "Bu amal uchun ruxsat yo‘q. /start bosing — menyu yangilanadi.",
+            reply_markup=await reply_kb_for(message.from_user.id),
+        )
+    return True
+
+
+async def _deny_stats(message: Message) -> bool:
+    if message.from_user and await can_view_stats(message.from_user.id):
         return False
     return True
 
 
 @router.message(F.text == BTN_ADD_LINK)
 async def add_link_prompt(message: Message, state: FSMContext) -> None:
-    if _deny(message):
+    if await _deny_manage(message):
         return
     await state.clear()
     await state.set_state(AddLinkStates.waiting_url)
     await message.answer(
         "To'liq URL yuboring (https://...).\nBekor qilish: /cancel",
-        reply_markup=main_kb(),
+        reply_markup=await _kb(message),
     )
 
 
 @router.message(F.text == BTN_ADD_CATEGORY)
 async def add_category_prompt(message: Message, state: FSMContext) -> None:
-    if _deny(message):
+    if await _deny_manage(message):
         return
     await state.clear()
     await state.set_state(AddCategoryStates.waiting_name)
@@ -979,13 +1072,13 @@ async def add_category_prompt(message: Message, state: FSMContext) -> None:
         "Yangi <b>kategoriya</b> nomini yuboring (masalan: Asosiy).\n"
         "Bekor qilish: /cancel",
         parse_mode=ParseMode.HTML,
-        reply_markup=main_kb(),
+        reply_markup=await _kb(message),
     )
 
 
 @router.message(AddCategoryStates.waiting_name, F.text & ~F.text.startswith("/"))
 async def add_category_save(message: Message, state: FSMContext) -> None:
-    if _deny(message):
+    if await _deny_manage(message):
         return
     name = (message.text or "").strip()
     if len(name) < 2:
@@ -1000,20 +1093,20 @@ async def add_category_save(message: Message, state: FSMContext) -> None:
     await message.answer(
         f"✅ Kategoriya saqlandi (id: <code>{cid}</code>).",
         parse_mode=ParseMode.HTML,
-        reply_markup=main_kb(),
+        reply_markup=await _kb(message),
     )
 
 
 @router.message(F.text == BTN_ADD_GROUP)
 async def add_group_prompt(message: Message, state: FSMContext) -> None:
-    if _deny(message):
+    if await _deny_manage(message):
         return
     await state.clear()
     await state.set_state(AddGroupStates.waiting_category)
     await message.answer(
         "Yangi guruh uchun avval <b>kategoriyani</b> tanlang:",
         parse_mode=ParseMode.HTML,
-        reply_markup=main_kb(),
+        reply_markup=await _kb(message),
     )
     await _send_promo_categories_pick(
         message,
@@ -1025,7 +1118,7 @@ async def add_group_prompt(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data.startswith("agc:"))
 async def add_group_pick_category(callback: CallbackQuery, state: FSMContext) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     try:
@@ -1054,7 +1147,7 @@ async def add_group_pick_category(callback: CallbackQuery, state: FSMContext) ->
 
 @router.message(AddGroupStates.waiting_name, F.text & ~F.text.startswith("/"))
 async def add_group_save(message: Message, state: FSMContext) -> None:
-    if _deny(message):
+    if await _deny_manage(message):
         return
     data = await state.get_data()
     category_id = data.get("add_group_category_id")
@@ -1062,7 +1155,7 @@ async def add_group_save(message: Message, state: FSMContext) -> None:
         await state.clear()
         await message.answer(
             "Kategoriya tanlanmadi. Qaytadan boshlang.",
-            reply_markup=main_kb(),
+            reply_markup=await _kb(message),
         )
         return
     name = (message.text or "").strip()
@@ -1078,7 +1171,7 @@ async def add_group_save(message: Message, state: FSMContext) -> None:
         await state.clear()
         await message.answer(
             f"Tanlangan kategoriya topilmadi. Qaytadan «{BTN_ADD_GROUP}» dan boshlang.",
-            reply_markup=main_kb(),
+            reply_markup=await _kb(message),
         )
         return
 
@@ -1120,7 +1213,7 @@ async def add_group_save(message: Message, state: FSMContext) -> None:
         f"🏛 {_h(category['name'])}\n"
         f"📁 {_h(name)} (id: <code>{gid}</code>)",
         parse_mode=ParseMode.HTML,
-        reply_markup=main_kb(),
+        reply_markup=await _kb(message),
     )
 
 
@@ -1137,15 +1230,29 @@ async def add_group_save(message: Message, state: FSMContext) -> None:
 @router.message(EditPromoStates.waiting_code, F.text.in_(MAIN_MENU_TEXTS))
 @router.message(EditCategoryStates.waiting_name, F.text.in_(MAIN_MENU_TEXTS))
 @router.message(EditGroupNameStates.waiting_name, F.text.in_(MAIN_MENU_TEXTS))
+@router.message(UserManageStates.waiting_admin_id, F.text.in_(MAIN_MENU_TEXTS))
+@router.message(UserManageStates.waiting_viewer_id, F.text.in_(MAIN_MENU_TEXTS))
 async def fsm_to_main_menu(message: Message, state: FSMContext) -> None:
     """FSM ichida pastki menyu tugmalari — holatni tozalaydi va buyruqni bajaradi."""
-    if _deny(message):
+    if not message.from_user:
         return
-    await state.clear()
     text = message.text or ""
     if text == BTN_STATS:
+        if await _deny_stats(message):
+            return
+        await state.clear()
         await stats_cmd(message)
-    elif text == BTN_LINKS:
+        return
+    if text == BTN_USERS:
+        if not await can_manage_users(message.from_user.id):
+            return
+        await state.clear()
+        await users_cmd(message, state)
+        return
+    if await _deny_manage(message):
+        return
+    await state.clear()
+    if text == BTN_LINKS:
         await list_links_cmd(message)
     elif text == BTN_PROMOS:
         await list_promos_cmd(message)
@@ -1166,7 +1273,7 @@ async def fsm_to_main_menu(message: Message, state: FSMContext) -> None:
 @router.callback_query(F.data == "hm:main")
 async def callback_home_menu(callback: CallbackQuery, state: FSMContext) -> None:
     """Inline menyudan pastki klaviaturaga qaytish."""
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_view_stats(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     await state.clear()
@@ -1175,14 +1282,15 @@ async def callback_home_menu(callback: CallbackQuery, state: FSMContext) -> None
             await callback.message.edit_reply_markup(reply_markup=None)
         except TelegramBadRequest:
             pass
-        await callback.message.answer("Pastki menyu:", reply_markup=main_kb())
+        kb = await reply_kb_for(callback.from_user.id)
+        await callback.message.answer("Pastki menyu:", reply_markup=kb)
     await callback.answer()
 
 
 @router.callback_query(F.data == "lb:list")
 async def link_list_back(callback: CallbackQuery) -> None:
     """Link kartochkasidan ro'yxatga qaytish."""
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     if callback.message:
@@ -1199,7 +1307,7 @@ async def link_list_back(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("ll:"))
 async def link_detail_open(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     try:
@@ -1221,7 +1329,7 @@ async def link_detail_open(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("le:"))
 async def link_edit_start(callback: CallbackQuery, state: FSMContext) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     try:
@@ -1248,7 +1356,7 @@ async def link_edit_start(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(EditLinkStates.waiting_new_url, F.text & ~F.text.startswith("/"))
 async def link_edit_save_url(message: Message, state: FSMContext) -> None:
-    if _deny(message):
+    if await _deny_manage(message):
         return
     data = await state.get_data()
     lid = data.get("edit_link_id")
@@ -1270,15 +1378,15 @@ async def link_edit_save_url(message: Message, state: FSMContext) -> None:
 
 @router.message(EditLinkStates.waiting_title, Command("skip"))
 async def link_edit_skip_title(message: Message, state: FSMContext) -> None:
-    if _deny(message):
+    if await _deny_manage(message):
         return
     await state.clear()
-    await message.answer("Tahrir yakunlandi.", reply_markup=main_kb())
+    await message.answer("Tahrir yakunlandi.", reply_markup=await _kb(message))
 
 
 @router.message(EditLinkStates.waiting_title, F.text)
 async def link_edit_save_title(message: Message, state: FSMContext) -> None:
-    if _deny(message):
+    if await _deny_manage(message):
         return
     data = await state.get_data()
     lid = data.get("edit_link_id")
@@ -1288,12 +1396,12 @@ async def link_edit_save_title(message: Message, state: FSMContext) -> None:
     title = (message.text or "").strip()
     await db.update_link_fields(lid, title=title if title else None)
     await state.clear()
-    await message.answer("Sarlavha saqlandi.", reply_markup=main_kb())
+    await message.answer("Sarlavha saqlandi.", reply_markup=await _kb(message))
 
 
 @router.callback_query(F.data.startswith("ld:"))
 async def link_delete_ask(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     try:
@@ -1328,7 +1436,7 @@ async def link_delete_ask(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("ldc:"))
 async def link_delete_do(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     try:
@@ -1354,7 +1462,7 @@ async def link_delete_do(callback: CallbackQuery) -> None:
 
 @router.message(AddLinkStates.waiting_url, F.text & ~F.text.startswith("/"))
 async def add_link_save(message: Message, state: FSMContext) -> None:
-    if _deny(message):
+    if await _deny_manage(message):
         return
     url = (message.text or "").strip()
     if not _is_valid_http_url(url):
@@ -1368,21 +1476,21 @@ async def add_link_save(message: Message, state: FSMContext) -> None:
         "QR markazidagi <b>logotip</b> uchun surat yoki PNG/JPEG <b>dokument</b> yuboring.\n"
         "O'tkazib yuborish: /skip",
         parse_mode=ParseMode.HTML,
-        reply_markup=main_kb(),
+        reply_markup=await _kb(message),
     )
 
 
 @router.message(AddLinkStates.optional_logo, Command("skip"))
 async def add_link_skip_logo(message: Message, state: FSMContext) -> None:
-    if _deny(message):
+    if await _deny_manage(message):
         return
     await state.clear()
-    await message.answer("Logotipsiz saqlandi.", reply_markup=main_kb())
+    await message.answer("Logotipsiz saqlandi.", reply_markup=await _kb(message))
 
 
 @router.message(AddLinkStates.optional_logo, F.text)
 async def add_link_logo_hint(message: Message, state: FSMContext) -> None:
-    if _deny(message):
+    if await _deny_manage(message):
         return
     await message.answer(
         "Logotipni <b>surat</b> yoki <b>dokument</b> (PNG/JPEG) sifatida yuboring, yoki /skip",
@@ -1392,7 +1500,7 @@ async def add_link_logo_hint(message: Message, state: FSMContext) -> None:
 
 @router.message(AddLinkStates.optional_logo, F.document | F.photo)
 async def add_link_save_logo(message: Message, state: FSMContext) -> None:
-    if _deny(message):
+    if await _deny_manage(message):
         return
     data = await state.get_data()
     lid = data.get("pending_link_id")
@@ -1406,18 +1514,18 @@ async def add_link_save_logo(message: Message, state: FSMContext) -> None:
         return
     await state.clear()
     await _send_link_detail(message, lid)
-    await message.answer("✅", reply_markup=main_kb())
+    await message.answer("✅", reply_markup=await _kb(message))
 
 
 @router.message(F.text == BTN_ADD_PROMO)
 async def add_promo_prompt(message: Message, state: FSMContext) -> None:
-    if _deny(message):
+    if await _deny_manage(message):
         return
     await state.clear()
     await state.set_state(AddPromoStates.waiting_group)
     await message.answer(
         "Yangi promo uchun avval kategoriyani tanlang:",
-        reply_markup=main_kb(),
+        reply_markup=await _kb(message),
     )
     await _send_promo_categories_pick(
         message,
@@ -1429,7 +1537,7 @@ async def add_promo_prompt(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "apc:list")
 async def add_promo_categories_back(callback: CallbackQuery, state: FSMContext) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     await state.set_state(AddPromoStates.waiting_group)
@@ -1449,7 +1557,7 @@ async def add_promo_categories_back(callback: CallbackQuery, state: FSMContext) 
 
 @router.callback_query(F.data.startswith("apc:"))
 async def add_promo_pick_category(callback: CallbackQuery, state: FSMContext) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     try:
@@ -1480,7 +1588,7 @@ async def add_promo_pick_category(callback: CallbackQuery, state: FSMContext) ->
 
 @router.callback_query(F.data.startswith("apg:"))
 async def add_promo_pick_group(callback: CallbackQuery, state: FSMContext) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     try:
@@ -1520,13 +1628,13 @@ async def add_promo_pick_group(callback: CallbackQuery, state: FSMContext) -> No
 
 @router.message(AddPromoStates.waiting_code, F.text & ~F.text.startswith("/"))
 async def add_promo_save(message: Message, state: FSMContext) -> None:
-    if _deny(message):
+    if await _deny_manage(message):
         return
     data = await state.get_data()
     group_id = data.get("add_promo_group_id")
     if not isinstance(group_id, int):
         await state.clear()
-        await message.answer("Guruh tanlanmadi. Qaytadan boshlang.", reply_markup=main_kb())
+        await message.answer("Guruh tanlanmadi. Qaytadan boshlang.", reply_markup=await _kb(message))
         return
     code = (message.text or "").strip()
     if len(code) < 2:
@@ -1536,18 +1644,18 @@ async def add_promo_save(message: Message, state: FSMContext) -> None:
         pid = await db.add_promo(code, group_id)
     except ValueError:
         await state.clear()
-        await message.answer("Guruh topilmadi. Qaytadan urinib ko'ring.", reply_markup=main_kb())
+        await message.answer("Guruh topilmadi. Qaytadan urinib ko'ring.", reply_markup=await _kb(message))
         return
     except DuplicateError:
         await message.answer("Bu guruhda bunday promo allaqachon mavjud.")
         return
     await state.clear()
-    await message.answer(f"✅ Promo saqlandi (id: {pid}).", reply_markup=main_kb())
+    await message.answer(f"✅ Promo saqlandi (id: {pid}).", reply_markup=await _kb(message))
 
 
 @router.message(F.text == BTN_LINKS)
 async def list_links_cmd(message: Message) -> None:
-    if _deny(message):
+    if await _deny_manage(message):
         return
     await _show_links_list_message(
         message,
@@ -1557,7 +1665,7 @@ async def list_links_cmd(message: Message) -> None:
 
 @router.message(F.text == BTN_PROMOS)
 async def list_promos_cmd(message: Message) -> None:
-    if _deny(message):
+    if await _deny_manage(message):
         return
     await _send_promo_categories_pick(
         message,
@@ -1568,7 +1676,7 @@ async def list_promos_cmd(message: Message) -> None:
 
 @router.callback_query(F.data == "pcat:list")
 async def promo_categories_list_back(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     if callback.message:
@@ -1586,7 +1694,7 @@ async def promo_categories_list_back(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("pcat:"))
 async def promo_category_open(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     try:
@@ -1614,7 +1722,7 @@ async def promo_category_open(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "pg:list")
 async def promo_groups_list_back(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     if callback.message:
@@ -1632,7 +1740,7 @@ async def promo_groups_list_back(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("pg:"))
 async def promo_group_open(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     try:
@@ -1652,7 +1760,7 @@ async def promo_group_open(callback: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("gec:"))
 async def group_edit_category_start(callback: CallbackQuery) -> None:
     """Guruhni boshqa kategoriyaga ko'chirish — kategoriyalar ro'yxati."""
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     try:
@@ -1691,7 +1799,7 @@ async def group_edit_category_start(callback: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("gecs:"))
 async def group_edit_category_save(callback: CallbackQuery) -> None:
     """Tanlangan kategoriyaga guruhni ko'chiradi."""
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     parts = callback.data.split(":")
@@ -1918,14 +2026,14 @@ async def _send_manage_group_detail(message: Message, group_id: int) -> None:
 
 @router.message(F.text == BTN_CATEGORIES)
 async def manage_categories_cmd(message: Message) -> None:
-    if _deny(message):
+    if await _deny_manage(message):
         return
     await _send_manage_categories_list(message)
 
 
 @router.callback_query(F.data == "vl:list")
 async def manage_categories_list_back(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     if callback.message:
@@ -1964,7 +2072,7 @@ def _parse_category_move(data: str) -> tuple[int, int, int | None] | None:
 
 @router.callback_query(F.data.startswith("vcmp:"))
 async def manage_category_move_list(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     parsed = _parse_category_move(callback.data or "")
@@ -1988,7 +2096,7 @@ async def manage_category_move_list(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("vcmd:"))
 async def manage_category_move_detail(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     parsed = _parse_category_move(callback.data or "")
@@ -2012,7 +2120,7 @@ async def manage_category_move_detail(callback: CallbackQuery) -> None:
 async def manage_category_rename_start(
     callback: CallbackQuery, state: FSMContext
 ) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     try:
@@ -2035,20 +2143,20 @@ async def manage_category_rename_start(
             f"🏛 Hozirgi nom: <b>{_h(category['name'])}</b>\n\n"
             "Yangi kategoriya nomini yuboring.\nBekor: /cancel",
             parse_mode=ParseMode.HTML,
-            reply_markup=main_kb(),
+            reply_markup=await _kb(message),
         )
     await callback.answer()
 
 
 @router.message(EditCategoryStates.waiting_name, F.text & ~F.text.startswith("/"))
 async def manage_category_rename_save(message: Message, state: FSMContext) -> None:
-    if _deny(message):
+    if await _deny_manage(message):
         return
     data = await state.get_data()
     category_id = data.get("edit_category_id")
     if not isinstance(category_id, int):
         await state.clear()
-        await message.answer("Qaytadan boshlang.", reply_markup=main_kb())
+        await message.answer("Qaytadan boshlang.", reply_markup=await _kb(message))
         return
     name = (message.text or "").strip()
     if len(name) < 2:
@@ -2061,15 +2169,15 @@ async def manage_category_rename_save(message: Message, state: FSMContext) -> No
         return
     await state.clear()
     if not ok:
-        await message.answer("Kategoriya topilmadi.", reply_markup=main_kb())
+        await message.answer("Kategoriya topilmadi.", reply_markup=await _kb(message))
         return
-    await message.answer("✅ Kategoriya nomi yangilandi.", reply_markup=main_kb())
+    await message.answer("✅ Kategoriya nomi yangilandi.", reply_markup=await _kb(message))
     await _send_manage_category_detail(message, category_id)
 
 
 @router.callback_query(F.data.startswith("vc:"))
 async def manage_category_open(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     try:
@@ -2093,7 +2201,7 @@ async def manage_category_open(callback: CallbackQuery) -> None:
 async def manage_group_rename_start(
     callback: CallbackQuery, state: FSMContext
 ) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     try:
@@ -2116,20 +2224,20 @@ async def manage_group_rename_start(
             f"📁 Hozirgi nom: <b>{_h(group['name'])}</b>\n\n"
             "Yangi guruh nomini yuboring.\nBekor: /cancel",
             parse_mode=ParseMode.HTML,
-            reply_markup=main_kb(),
+            reply_markup=await _kb(message),
         )
     await callback.answer()
 
 
 @router.message(EditGroupNameStates.waiting_name, F.text & ~F.text.startswith("/"))
 async def manage_group_rename_save(message: Message, state: FSMContext) -> None:
-    if _deny(message):
+    if await _deny_manage(message):
         return
     data = await state.get_data()
     group_id = data.get("edit_group_id")
     if not isinstance(group_id, int):
         await state.clear()
-        await message.answer("Qaytadan boshlang.", reply_markup=main_kb())
+        await message.answer("Qaytadan boshlang.", reply_markup=await _kb(message))
         return
     name = (message.text or "").strip()
     if len(name) < 2:
@@ -2142,15 +2250,15 @@ async def manage_group_rename_save(message: Message, state: FSMContext) -> None:
         return
     await state.clear()
     if not ok:
-        await message.answer("Guruh topilmadi.", reply_markup=main_kb())
+        await message.answer("Guruh topilmadi.", reply_markup=await _kb(message))
         return
-    await message.answer("✅ Guruh nomi yangilandi.", reply_markup=main_kb())
+    await message.answer("✅ Guruh nomi yangilandi.", reply_markup=await _kb(message))
     await _send_manage_group_detail(message, group_id)
 
 
 @router.callback_query(F.data.startswith("vg:"))
 async def manage_group_open(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     try:
@@ -2172,7 +2280,7 @@ async def manage_group_open(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("vgc:"))
 async def manage_group_move_category_start(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     try:
@@ -2210,7 +2318,7 @@ async def manage_group_move_category_start(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("vgcs:"))
 async def manage_group_move_category_save(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     parts = callback.data.split(":")
@@ -2251,7 +2359,7 @@ async def manage_group_move_category_save(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("pp:"))
 async def promo_detail_open(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     parts = callback.data.split(":")
@@ -2274,7 +2382,7 @@ async def promo_detail_open(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("pec:"))
 async def promo_edit_code_start(callback: CallbackQuery, state: FSMContext) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     try:
@@ -2297,7 +2405,7 @@ async def promo_edit_code_start(callback: CallbackQuery, state: FSMContext) -> N
 
 @router.message(EditPromoStates.waiting_code, F.text & ~F.text.startswith("/"))
 async def promo_edit_code_save(message: Message, state: FSMContext) -> None:
-    if _deny(message):
+    if await _deny_manage(message):
         return
     data = await state.get_data()
     promo_id = data.get("edit_promo_id")
@@ -2315,15 +2423,15 @@ async def promo_edit_code_save(message: Message, state: FSMContext) -> None:
         return
     await state.clear()
     if not ok:
-        await message.answer("Promo topilmadi.", reply_markup=main_kb())
+        await message.answer("Promo topilmadi.", reply_markup=await _kb(message))
         return
     await _send_promo_detail(message, promo_id)
-    await message.answer("✅", reply_markup=main_kb())
+    await message.answer("✅", reply_markup=await _kb(message))
 
 
 @router.callback_query(F.data.startswith("peg:"))
 async def promo_edit_group_start(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     try:
@@ -2346,7 +2454,7 @@ async def promo_edit_group_start(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("pegc:"))
 async def promo_edit_group_pick_category(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     parts = callback.data.split(":")
@@ -2383,7 +2491,7 @@ async def promo_edit_group_pick_category(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("pegs:"))
 async def promo_edit_group_save(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     parts = callback.data.split(":")
@@ -2442,14 +2550,33 @@ def _kb_stats_group_detail(category_id: int, group_id: int) -> InlineKeyboardMar
     )
 
 
+def _filter_stats_by_scope(
+    rows: list[dict],
+    scope: set[int] | None,
+    *,
+    key: str = "category_id",
+) -> list[dict]:
+    if scope is None:
+        return rows
+    return [r for r in rows if int(r.get(key) or 0) in scope]
+
+
 async def _show_stats_root(
-    message: Message, *, page: int = 0, edit: bool = False
+    message: Message, *, user_id: int, page: int = 0, edit: bool = False
 ) -> None:
     """Statistika bosh sahifasi: kategoriyalar + jami yuklanish."""
-    totals = await db.stats_category_totals()
+    scope = await category_scope(user_id)
+    if scope is not None and len(scope) == 0:
+        await message.answer(
+            "Sizga hali kategoriya biriktirilmagan.\n"
+            "Super-admin «👥 Foydalanuvchilar» dan kamida 1 kategoriya belgilashi kerak.",
+            reply_markup=_kb_menu_only(),
+        )
+        return
+    totals = _filter_stats_by_scope(await db.stats_category_totals(), scope)
     if not totals:
         await message.answer(
-            f"Hozircha kategoriyalar yo'q. Avval «{BTN_ADD_CATEGORY}» bilan qo'shing.",
+            "Sizga biriktirilgan kategoriyalar yo'q yoki hali statistika bo'sh.",
             reply_markup=_kb_menu_only(),
         )
         return
@@ -2511,9 +2638,17 @@ async def _show_stats_root(
 
 
 async def _show_stats_groups_in_category(
-    message: Message, category_id: int, *, page: int = 0, edit: bool = False
+    message: Message,
+    category_id: int,
+    *,
+    user_id: int,
+    page: int = 0,
+    edit: bool = False,
 ) -> None:
     """Kategoriya ichidagi guruhlar + jami yuklanish."""
+    if not await can_access_category(user_id, category_id):
+        await message.answer("Bu kategoriyaga ruxsat yo'q.", reply_markup=_kb_menu_only())
+        return
     category = await db.get_category(category_id)
     if not category:
         await message.answer("Kategoriya topilmadi.", reply_markup=_kb_menu_only())
@@ -2576,7 +2711,7 @@ async def _show_stats_groups_in_category(
     footer = (
         "Guruhni tanlang:"
         if totals
-        else f"«{BTN_ADD_GROUP}» bilan guruh qo'shing."
+        else "Bu kategoriyada guruhlar yo'q."
     )
     text = (
         "📊 <b>Statistika</b>\n"
@@ -2595,7 +2730,12 @@ async def _show_stats_groups_in_category(
     )
 
 
-async def _send_stats_for_group_detail(message: Message, group_id: int) -> None:
+async def _send_stats_for_group_detail(
+    message: Message, group_id: int, *, user_id: int
+) -> None:
+    if not await can_access_group(user_id, group_id):
+        await message.answer("Bu guruhga ruxsat yo'q.", reply_markup=_kb_menu_only())
+        return
     group = await db.get_group(group_id)
     if not group:
         await message.answer("Guruh topilmadi.", reply_markup=_kb_menu_only())
@@ -2804,7 +2944,7 @@ async def _answer_stats_excel(
 @router.callback_query(F.data == "stat:clist")
 @router.callback_query(F.data == "stat:glist")
 async def stats_back_to_categories(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_view_stats(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     if callback.message:
@@ -2812,19 +2952,22 @@ async def stats_back_to_categories(callback: CallbackQuery) -> None:
             await callback.message.edit_reply_markup(reply_markup=None)
         except TelegramBadRequest:
             pass
-        await _show_stats_root(callback.message)
+        await _show_stats_root(callback.message, user_id=callback.from_user.id)
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("statc:"))
 async def stats_open_category(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_view_stats(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     try:
         category_id = int(callback.data.split(":")[1])
     except (IndexError, ValueError):
         await callback.answer("Xato", show_alert=True)
+        return
+    if not await can_access_category(callback.from_user.id, category_id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     if not await db.get_category(category_id):
         await callback.answer("Kategoriya topilmadi", show_alert=True)
@@ -2834,19 +2977,24 @@ async def stats_open_category(callback: CallbackQuery) -> None:
             await callback.message.edit_reply_markup(reply_markup=None)
         except TelegramBadRequest:
             pass
-        await _show_stats_groups_in_category(callback.message, category_id)
+        await _show_stats_groups_in_category(
+            callback.message, category_id, user_id=callback.from_user.id
+        )
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("statg:"))
 async def stats_open_group(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_view_stats(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     try:
         group_id = int(callback.data.split(":")[1])
     except (IndexError, ValueError):
         await callback.answer("Xato", show_alert=True)
+        return
+    if not await can_access_group(callback.from_user.id, group_id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     if not await db.get_group(group_id):
         await callback.answer("Guruh topilmadi", show_alert=True)
@@ -2856,21 +3004,27 @@ async def stats_open_group(callback: CallbackQuery) -> None:
             await callback.message.edit_reply_markup(reply_markup=None)
         except TelegramBadRequest:
             pass
-        await _send_stats_for_group_detail(callback.message, group_id)
+        await _send_stats_for_group_detail(
+            callback.message, group_id, user_id=callback.from_user.id
+        )
     await callback.answer()
 
 
 @router.callback_query(F.data == "stat:xlsx")
 async def stats_export_excel(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_view_stats(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     await callback.answer("Tayyorlanmoqda…")
+    scope = await category_scope(callback.from_user.id)
     category_rows, group_rows, promo_rows = await asyncio.gather(
         db.stats_category_totals(),
         db.stats_group_totals_desc(),
         db.stats_summary_by_group(),
     )
+    category_rows = _filter_stats_by_scope(category_rows, scope)
+    group_rows = _filter_stats_by_scope(group_rows, scope)
+    promo_rows = _filter_stats_by_scope(promo_rows, scope)
     if not callback.message:
         return
     await _answer_stats_excel(
@@ -2885,13 +3039,16 @@ async def stats_export_excel(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("statxc:"))
 async def stats_export_category_excel(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_view_stats(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     try:
         category_id = int(callback.data.split(":")[1])
     except (IndexError, ValueError):
         await callback.answer("Xato", show_alert=True)
+        return
+    if not await can_access_category(callback.from_user.id, category_id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     category = await db.get_category(category_id)
     if not category:
@@ -2930,13 +3087,16 @@ async def stats_export_category_excel(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("statxg:"))
 async def stats_export_group_excel(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_view_stats(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     try:
         group_id = int(callback.data.split(":")[1])
     except (IndexError, ValueError):
         await callback.answer("Xato", show_alert=True)
+        return
+    if not await can_access_group(callback.from_user.id, group_id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     group = await db.get_group(group_id)
     if not group:
@@ -2997,9 +3157,9 @@ async def stats_export_group_excel(callback: CallbackQuery) -> None:
 
 @router.message(F.text == BTN_STATS)
 async def stats_cmd(message: Message) -> None:
-    if _deny(message):
+    if await _deny_stats(message) or not message.from_user:
         return
-    await _show_stats_root(message)
+    await _show_stats_root(message, user_id=message.from_user.id)
 
 
 async def _send_qr_link_pick(
@@ -3413,14 +3573,14 @@ async def _deliver_bulk_promo_qrs(
 
 @router.message(F.text == BTN_QR)
 async def qr_pick_link(message: Message) -> None:
-    if _deny(message):
+    if await _deny_manage(message):
         return
     await _send_qr_link_pick(message)
 
 
 @router.callback_query(F.data == "qr:bl")
 async def qr_back_to_links(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     if callback.message:
@@ -3434,7 +3594,7 @@ async def qr_back_to_links(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("qrcl:"))
 async def qr_back_to_category_pick(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     try:
@@ -3456,7 +3616,7 @@ async def qr_back_to_category_pick(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("qrc:"))
 async def qr_open_category_for_groups(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     parts = callback.data.split(":")
@@ -3484,7 +3644,7 @@ async def qr_open_category_for_groups(callback: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("qrgc:"))
 async def qr_back_to_groups_in_category(callback: CallbackQuery) -> None:
     """Promo tanlashdan guruhlar ro'yxatiga (shu kategoriya)."""
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     parts = callback.data.split(":")
@@ -3514,7 +3674,7 @@ async def qr_back_to_groups_in_category(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("qrg:"))
 async def qr_open_group_for_promos(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     parts = callback.data.split(":")
@@ -3541,7 +3701,7 @@ async def qr_open_group_for_promos(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("qbulkg:"))
 async def qr_bulk_group_open_style_menu(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     parts = callback.data.split(":")
@@ -3570,7 +3730,7 @@ async def qr_bulk_group_open_style_menu(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("qrxlall:"))
 async def qr_excel_all_promos(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     try:
@@ -3600,7 +3760,7 @@ async def qr_excel_all_promos(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("qrxlc:"))
 async def qr_excel_one_category(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     parts = callback.data.split(":")
@@ -3638,7 +3798,7 @@ async def qr_excel_one_category(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("qrxlg:"))
 async def qr_excel_one_group(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     parts = callback.data.split(":")
@@ -3673,7 +3833,7 @@ async def qr_excel_one_group(callback: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("qbulk:"))
 async def qr_bulk_open_style_menu(callback: CallbackQuery) -> None:
     """Eski «barcha promo QR» — endi Excel ga yo'naltiriladi."""
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     try:
@@ -3697,7 +3857,7 @@ async def qr_bulk_open_style_menu(callback: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("qall:"))
 async def qr_all_promos_bulk(callback: CallbackQuery) -> None:
     """Eski global bulk — Excel ga yo'naltiriladi (guruh bulk: qallg:)."""
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     parts = callback.data.split(":")
@@ -3727,7 +3887,7 @@ async def qr_all_promos_bulk(callback: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("qallg:"))
 async def qr_all_promos_in_group_bulk(callback: CallbackQuery) -> None:
     """Tanlangan link + guruh uchun barcha promo QR."""
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     parts = callback.data.split(":")
@@ -3770,7 +3930,7 @@ async def qr_all_promos_in_group_bulk(callback: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("qmore:"))
 async def qr_bulk_more(callback: CallbackQuery) -> None:
     """Keyingi 40 ta (yoki kamroq) QR partiyasi."""
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     parts = callback.data.split(":")
@@ -3820,7 +3980,7 @@ async def qr_bulk_more(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("lg:"))
 async def link_logo_callback(callback: CallbackQuery, state: FSMContext) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     try:
@@ -3844,7 +4004,7 @@ async def link_logo_callback(callback: CallbackQuery, state: FSMContext) -> None
 
 @router.message(LogoForLinkStates.waiting_file, F.document | F.photo)
 async def link_logo_save_for_existing(message: Message, state: FSMContext) -> None:
-    if _deny(message):
+    if await _deny_manage(message):
         return
     data = await state.get_data()
     lid = data.get("logo_link_id")
@@ -3858,12 +4018,12 @@ async def link_logo_save_for_existing(message: Message, state: FSMContext) -> No
         return
     await state.clear()
     await _send_link_detail(message, lid)
-    await message.answer("✅", reply_markup=main_kb())
+    await message.answer("✅", reply_markup=await _kb(message))
 
 
 @router.callback_query(F.data.startswith("ql:"))
 async def qr_pick_promo(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     try:
@@ -3882,7 +4042,7 @@ async def qr_pick_promo(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("qp:"))
 async def qr_choose_style(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     parts = callback.data.split(":")
@@ -3942,7 +4102,7 @@ async def qr_choose_style(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("qst:"))
 async def qr_build(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     parts = callback.data.split(":")
@@ -4015,7 +4175,7 @@ async def qr_build(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("navll:"))
 async def nav_links_list(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     try:
@@ -4035,7 +4195,7 @@ async def nav_links_list(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("navcat:"))
 async def nav_categories(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     # navcat:{page}:{prefix...}
@@ -4061,7 +4221,7 @@ async def nav_categories(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("navgrp:"))
 async def nav_groups(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     # navgrp:{page}:{category_id}:{prefix...}
@@ -4088,7 +4248,7 @@ async def nav_groups(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("navpromo:"))
 async def nav_promos_in_group(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     parts = callback.data.split(":")
@@ -4110,7 +4270,7 @@ async def nav_promos_in_group(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("navvc:"))
 async def nav_manage_categories(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     try:
@@ -4127,7 +4287,7 @@ async def nav_manage_categories(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("navvg:"))
 async def nav_manage_category_groups(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     parts = callback.data.split(":")
@@ -4149,7 +4309,7 @@ async def nav_manage_category_groups(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("navstatc:"))
 async def nav_stats_categories(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_view_stats(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     try:
@@ -4158,13 +4318,18 @@ async def nav_stats_categories(callback: CallbackQuery) -> None:
         await callback.answer("Xato", show_alert=True)
         return
     if callback.message:
-        await _show_stats_root(callback.message, page=page, edit=True)
+        await _show_stats_root(
+            callback.message,
+            user_id=callback.from_user.id,
+            page=page,
+            edit=True,
+        )
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("navstatg:"))
 async def nav_stats_groups(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_view_stats(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     parts = callback.data.split(":")
@@ -4177,16 +4342,23 @@ async def nav_stats_groups(callback: CallbackQuery) -> None:
     except ValueError:
         await callback.answer("Xato", show_alert=True)
         return
+    if not await can_access_category(callback.from_user.id, category_id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
     if callback.message:
         await _show_stats_groups_in_category(
-            callback.message, category_id, page=page, edit=True
+            callback.message,
+            category_id,
+            user_id=callback.from_user.id,
+            page=page,
+            edit=True,
         )
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("navql:"))
 async def nav_qr_links(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     try:
@@ -4201,7 +4373,7 @@ async def nav_qr_links(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("navqrg:"))
 async def nav_qr_groups(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     parts = callback.data.split(":")
@@ -4224,7 +4396,7 @@ async def nav_qr_groups(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("navqrp:"))
 async def nav_qr_promos(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
+    if not callback.from_user or not await can_manage(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     parts = callback.data.split(":")
@@ -4243,6 +4415,568 @@ async def nav_qr_promos(callback: CallbackQuery) -> None:
             callback.message, link_id, group_id, page=page, edit=True
         )
     await callback.answer()
+
+
+# ── Super-admin: foydalanuvchilar (admin / viewer) ───────────────────────────
+
+
+def _parse_telegram_id(raw: str) -> int | None:
+    s = (raw or "").strip()
+    if s.isdigit():
+        value = int(s)
+        return value if value > 0 else None
+    return None
+
+
+async def _push_role_keyboard(bot: Bot, telegram_id: int) -> bool:
+    """Rol o'zgaganda target userga yangi pastki menyuni yuboradi.
+
+    True — yuborildi. False — foydalanuvchi botni ochmagan/bloklagan
+    (u holda /start bosishi kerak).
+    """
+    role = await get_role(telegram_id)
+    try:
+        if role is None:
+            await bot.send_message(
+                telegram_id,
+                "Sizning botga kirish huquqingiz olib tashlandi.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+        elif role == access.ROLE_VIEWER:
+            await bot.send_message(
+                telegram_id,
+                "Rolingiz yangilandi: <b>viewer</b>.\n"
+                "Endi faqat statistika va Excel mavjud.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=await reply_kb_for(telegram_id),
+            )
+        elif role == access.ROLE_ADMIN:
+            await bot.send_message(
+                telegram_id,
+                "Rolingiz yangilandi: <b>admin</b>.\n"
+                "To‘liq boshqaruv menyusi ochildi.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=await reply_kb_for(telegram_id),
+            )
+        else:
+            await bot.send_message(
+                telegram_id,
+                "Menyu yangilandi.",
+                reply_markup=await reply_kb_for(telegram_id),
+            )
+        return True
+    except (TelegramForbiddenError, TelegramBadRequest) as exc:
+        logging.info(
+            "Rol klaviaturasini yuborib bo'lmadi tid=%s: %s",
+            telegram_id,
+            exc,
+        )
+        return False
+
+
+def _push_kb_note(ok: bool) -> str:
+    if ok:
+        return "\n<i>Foydalanuvchiga yangi menyu yuborildi.</i>"
+    return (
+        "\n<i>Menyu yuborilmadi — foydalanuvchi botni ochmagan yoki bloklagan. "
+        "U /start bosishi kerak.</i>"
+    )
+
+
+async def _show_users_panel(message: Message, *, edit: bool = False) -> None:
+    users = await db.list_bot_users()
+    lines: list[str] = ["👥 <b>Foydalanuvchilar</b>\n"]
+    if not users:
+        lines.append("<i>Hali admin/viewer yo'q. Qo'lda qo'shing.</i>")
+    else:
+        for u in users:
+            tid = int(u["telegram_id"])
+            role = str(u["role"])
+            name = str(u.get("display_name") or "").strip()
+            label = f"{name} " if name else ""
+            extra = ""
+            if role == "viewer":
+                cats = await db.list_viewer_categories(tid)
+                if cats:
+                    extra = " — " + ", ".join(str(c["name"]) for c in cats[:5])
+                    if len(cats) > 5:
+                        extra += "…"
+                else:
+                    extra = " — <i>kategoriya yo'q</i>"
+            lines.append(
+                f"• {label}<code>{tid}</code> — <b>{_h(role)}</b>{extra}"
+            )
+    lines.append(
+        "\n<i>Super-admin faqat <code>ADMIN_IDS</code> (env) da — "
+        "bu ro'yxatga kiritilmaydi.</i>"
+    )
+    buttons: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(text="➕ Admin", callback_data="usr:add:admin"),
+            InlineKeyboardButton(text="➕ Viewer", callback_data="usr:add:viewer"),
+        ]
+    ]
+    for u in users:
+        tid = int(u["telegram_id"])
+        role = str(u["role"])
+        row = [
+            InlineKeyboardButton(
+                text=f"🗑 {tid}",
+                callback_data=f"usr:del:{tid}",
+            )
+        ]
+        if role == "viewer":
+            row.insert(
+                0,
+                InlineKeyboardButton(
+                    text=f"🏛 {tid}",
+                    callback_data=f"usr:cats:{tid}",
+                ),
+            )
+        buttons.append(row)
+    buttons.append(_row_menu())
+    text = "\n".join(lines)
+    await _send_or_edit(
+        message,
+        text,
+        InlineKeyboardMarkup(inline_keyboard=buttons),
+        edit=edit,
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.message(F.text == BTN_USERS)
+async def users_cmd(message: Message, state: FSMContext) -> None:
+    if not message.from_user or not await can_manage_users(message.from_user.id):
+        return
+    await state.clear()
+    await _show_users_panel(message)
+
+
+@router.callback_query(F.data == "usr:list")
+async def users_list_cb(callback: CallbackQuery, state: FSMContext) -> None:
+    if not callback.from_user or not await can_manage_users(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+    await state.clear()
+    if callback.message:
+        await _show_users_panel(callback.message, edit=True)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "usr:add:admin")
+async def users_add_admin_prompt(callback: CallbackQuery, state: FSMContext) -> None:
+    if not callback.from_user or not await can_manage_users(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+    await state.set_state(UserManageStates.waiting_admin_id)
+    if callback.message:
+        await callback.message.answer(
+            "Yangi <b>admin</b> Telegram ID sini yuboring (faqat raqam).\n"
+            "Bekor: /cancel",
+            parse_mode=ParseMode.HTML,
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "usr:add:viewer")
+async def users_add_viewer_prompt(callback: CallbackQuery, state: FSMContext) -> None:
+    if not callback.from_user or not await can_manage_users(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+    await state.set_state(UserManageStates.waiting_viewer_id)
+    if callback.message:
+        await callback.message.answer(
+            "Yangi <b>viewer</b> Telegram ID sini yuboring (faqat raqam).\n"
+            "Keyin kategoriyalarni tanlaysiz.\nBekor: /cancel",
+            parse_mode=ParseMode.HTML,
+        )
+    await callback.answer()
+
+
+@router.message(UserManageStates.waiting_admin_id, F.text & ~F.text.startswith("/"))
+async def users_save_admin(message: Message, state: FSMContext) -> None:
+    if not message.from_user or not await can_manage_users(message.from_user.id):
+        return
+    tid = _parse_telegram_id(message.text or "")
+    if tid is None:
+        await message.answer("Noto'g'ri ID. Musbat butun son yuboring.")
+        return
+    if is_super_admin(tid):
+        await message.answer(
+            "Bu ID allaqachon env super-admin. DB ga qo'shish shart emas."
+        )
+        await state.clear()
+        return
+
+    existing = await db.get_bot_user(tid)
+    await state.clear()
+    if existing and existing["role"] == "admin":
+        await message.answer(
+            f"<code>{tid}</code> allaqachon <b>admin</b>.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=await reply_kb_for(message.from_user.id),
+        )
+        return
+    if existing and existing["role"] == "viewer":
+        await message.answer(
+            f"<code>{tid}</code> hozir <b>viewer</b>.\n"
+            "Admin qilinsinmi? Kategoriyalar o‘chadi.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="✅ Ha, admin qil",
+                            callback_data=f"usr:ok:admin:{tid}",
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            text="❌ Bekor",
+                            callback_data="usr:list",
+                        )
+                    ],
+                ]
+            ),
+        )
+        return
+
+    await _apply_admin_role(message, tid, actor_id=message.from_user.id)
+
+
+async def _apply_admin_role(
+    message: Message, tid: int, *, actor_id: int
+) -> None:
+    await db.upsert_bot_user(tid, "admin")
+    pushed = await _push_role_keyboard(message.bot, tid)
+    kb = await reply_kb_for(actor_id)
+    await message.answer(
+        f"✅ Admin: <code>{tid}</code>{_push_kb_note(pushed)}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb,
+    )
+    await _show_users_panel(message)
+
+
+@router.message(UserManageStates.waiting_viewer_id, F.text & ~F.text.startswith("/"))
+async def users_save_viewer(message: Message, state: FSMContext) -> None:
+    if not message.from_user or not await can_manage_users(message.from_user.id):
+        return
+    tid = _parse_telegram_id(message.text or "")
+    if tid is None:
+        await message.answer("Noto'g'ri ID. Musbat butun son yuboring.")
+        return
+    if is_super_admin(tid):
+        await message.answer("Bu ID env super-admin — viewer qilib bo'lmaydi.")
+        await state.clear()
+        return
+
+    existing = await db.get_bot_user(tid)
+    await state.clear()
+    if existing and existing["role"] == "viewer":
+        await message.answer(
+            f"<code>{tid}</code> allaqachon <b>viewer</b>.\n"
+            "Kategoriyalarni shu yerda o‘zgartiring:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=await reply_kb_for(message.from_user.id),
+        )
+        await _show_viewer_category_picker(message, tid)
+        return
+    if existing and existing["role"] == "admin":
+        await message.answer(
+            f"<code>{tid}</code> hozir <b>admin</b>.\n"
+            "Viewer qilinsinmi? Keyin kamida 1 kategoriya tanlash shart.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="✅ Ha, viewer qil",
+                            callback_data=f"usr:ok:viewer:{tid}",
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            text="❌ Bekor",
+                            callback_data="usr:list",
+                        )
+                    ],
+                ]
+            ),
+        )
+        return
+
+    await _start_viewer_setup(message, tid, actor_id=message.from_user.id)
+
+
+async def _start_viewer_setup(
+    message: Message, tid: int, *, actor_id: int
+) -> None:
+    """Viewer yaratadi; menyu faqat kategoriya tanlangandan keyin yuboriladi."""
+    await db.upsert_bot_user(tid, "viewer")
+    kb = await reply_kb_for(actor_id)
+    await message.answer(
+        f"✅ Viewer yaratildi: <code>{tid}</code>\n"
+        "Kamida <b>1 kategoriya</b> tanlang, so‘ng <b>✅ Tayyor</b> ni bosing.\n"
+        "<i>Tayyor bosilmaguncha foydalanuvchiga menyu yuborilmaydi.</i>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb,
+    )
+    await _show_viewer_category_picker(message, tid)
+
+
+@router.callback_query(F.data.startswith("usr:ok:admin:"))
+async def users_confirm_admin(callback: CallbackQuery) -> None:
+    if not callback.from_user or not await can_manage_users(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+    try:
+        tid = int(callback.data.split(":")[3])
+    except (IndexError, ValueError):
+        await callback.answer("Xato", show_alert=True)
+        return
+    if is_super_admin(tid):
+        await callback.answer("Super-admin", show_alert=True)
+        return
+    if callback.message:
+        await _apply_admin_role(
+            callback.message, tid, actor_id=callback.from_user.id
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("usr:ok:viewer:"))
+async def users_confirm_viewer(callback: CallbackQuery) -> None:
+    if not callback.from_user or not await can_manage_users(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+    try:
+        tid = int(callback.data.split(":")[3])
+    except (IndexError, ValueError):
+        await callback.answer("Xato", show_alert=True)
+        return
+    if is_super_admin(tid):
+        await callback.answer("Super-admin", show_alert=True)
+        return
+    if callback.message:
+        await _start_viewer_setup(
+            callback.message, tid, actor_id=callback.from_user.id
+        )
+    await callback.answer()
+
+
+async def _show_viewer_category_picker(
+    message: Message, telegram_id: int, *, edit: bool = False
+) -> None:
+    categories = await db.list_categories()
+    selected = await db.list_viewer_category_ids(telegram_id)
+    if not categories:
+        await message.answer(
+            "Avval kategoriya yarating, keyin viewer ga biriktiring.",
+            reply_markup=_kb_menu_only(),
+        )
+        return
+    buttons: list[list[InlineKeyboardButton]] = []
+    for c in categories:
+        cid = int(c["id"])
+        mark = "✅ " if cid in selected else ""
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{mark}{str(c['name'])[:48]}",
+                    callback_data=f"usr:tog:{telegram_id}:{cid}",
+                )
+            ]
+        )
+    n_sel = len(selected)
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                text=f"✅ Tayyor ({n_sel})",
+                callback_data=f"usr:done:{telegram_id}",
+            )
+        ]
+    )
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                text="◀️ Foydalanuvchilar",
+                callback_data="usr:list",
+            )
+        ]
+    )
+    buttons.append(_row_menu())
+    warn = ""
+    if n_sel == 0:
+        warn = "\n\n⚠️ <b>Kamida 1 kategoriya tanlang</b> — aks holda stats bo‘sh."
+    text = (
+        f"🏛 Viewer <code>{telegram_id}</code> kategoriyalari\n"
+        "Bosib yoqing/o‘chiring (bir nechta mumkin)."
+        f"{warn}"
+    )
+    await _send_or_edit(
+        message,
+        text,
+        InlineKeyboardMarkup(inline_keyboard=buttons),
+        edit=edit,
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.callback_query(F.data.startswith("usr:done:"))
+async def users_viewer_done(callback: CallbackQuery) -> None:
+    if not callback.from_user or not await can_manage_users(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+    try:
+        tid = int(callback.data.split(":")[2])
+    except (IndexError, ValueError):
+        await callback.answer("Xato", show_alert=True)
+        return
+    user = await db.get_bot_user(tid)
+    if not user or user["role"] != "viewer":
+        await callback.answer("Viewer topilmadi", show_alert=True)
+        return
+    selected = await db.list_viewer_category_ids(tid)
+    if not selected:
+        await callback.answer("Kamida 1 kategoriya tanlang", show_alert=True)
+        return
+    pushed = await _push_role_keyboard(callback.bot, tid)
+    await callback.answer("Saqlandi")
+    if callback.message:
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except TelegramBadRequest:
+            pass
+        await callback.message.answer(
+            f"✅ Viewer <code>{tid}</code> tayyor "
+            f"({len(selected)} kategoriya).{_push_kb_note(pushed)}",
+            parse_mode=ParseMode.HTML,
+        )
+        await _show_users_panel(callback.message)
+
+
+@router.callback_query(F.data.startswith("usr:cats:"))
+async def users_edit_viewer_cats(callback: CallbackQuery) -> None:
+    if not callback.from_user or not await can_manage_users(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+    try:
+        tid = int(callback.data.split(":")[2])
+    except (IndexError, ValueError):
+        await callback.answer("Xato", show_alert=True)
+        return
+    user = await db.get_bot_user(tid)
+    if not user or user["role"] != "viewer":
+        await callback.answer("Viewer topilmadi", show_alert=True)
+        return
+    if callback.message:
+        await _show_viewer_category_picker(callback.message, tid, edit=True)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("usr:tog:"))
+async def users_toggle_viewer_cat(callback: CallbackQuery) -> None:
+    if not callback.from_user or not await can_manage_users(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+    parts = callback.data.split(":")
+    if len(parts) != 4:
+        await callback.answer("Xato", show_alert=True)
+        return
+    try:
+        tid = int(parts[2])
+        category_id = int(parts[3])
+    except ValueError:
+        await callback.answer("Xato", show_alert=True)
+        return
+    user = await db.get_bot_user(tid)
+    if not user or user["role"] != "viewer":
+        await callback.answer("Viewer topilmadi", show_alert=True)
+        return
+    if not await db.get_category(category_id):
+        await callback.answer("Kategoriya topilmadi", show_alert=True)
+        return
+    added = await db.toggle_viewer_category(tid, category_id)
+    if callback.message:
+        await _show_viewer_category_picker(callback.message, tid, edit=True)
+    await callback.answer("Qo'shildi" if added else "Olib tashlandi")
+
+
+@router.callback_query(F.data.startswith("usr:del:"))
+async def users_delete_ask(callback: CallbackQuery) -> None:
+    if not callback.from_user or not await can_manage_users(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+    try:
+        tid = int(callback.data.split(":")[2])
+    except (IndexError, ValueError):
+        await callback.answer("Xato", show_alert=True)
+        return
+    if is_super_admin(tid):
+        await callback.answer("Super-adminni o'chirib bo'lmaydi", show_alert=True)
+        return
+    user = await db.get_bot_user(tid)
+    if not user:
+        await callback.answer("Topilmadi", show_alert=True)
+        return
+    role = str(user["role"])
+    if not callback.message:
+        await callback.answer()
+        return
+    await callback.message.answer(
+        f"🗑 <code>{tid}</code> ({_h(role)}) o‘chirilsinmi?",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="✅ Ha, o‘chirish",
+                        callback_data=f"usr:delok:{tid}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="❌ Bekor",
+                        callback_data="usr:list",
+                    )
+                ],
+            ]
+        ),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("usr:delok:"))
+async def users_delete_confirm(callback: CallbackQuery) -> None:
+    if not callback.from_user or not await can_manage_users(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+    try:
+        tid = int(callback.data.split(":")[2])
+    except (IndexError, ValueError):
+        await callback.answer("Xato", show_alert=True)
+        return
+    if is_super_admin(tid):
+        await callback.answer("Super-adminni o'chirib bo'lmaydi", show_alert=True)
+        return
+    ok = await db.delete_bot_user(tid)
+    if not ok:
+        await callback.answer("Topilmadi", show_alert=True)
+        return
+    pushed = await _push_role_keyboard(callback.bot, tid)
+    if callback.message:
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except TelegramBadRequest:
+            pass
+        await callback.message.answer(
+            f"🗑 <code>{tid}</code> o‘chirildi.{_push_kb_note(pushed)}",
+            parse_mode=ParseMode.HTML,
+        )
+        await _show_users_panel(callback.message)
+    await callback.answer("O'chirildi")
 
 
 def get_dispatcher() -> Dispatcher:

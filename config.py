@@ -27,8 +27,7 @@ RATE_LIMIT_ENABLED = os.getenv("RATE_LIMIT_ENABLED", "true").lower() in (
 RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "120"))
 RATE_LIMIT_WINDOW_SEC = float(os.getenv("RATE_LIMIT_WINDOW_SEC", "60"))
 
-DEDUP_IP_UA_WINDOW_HOURS = float(os.getenv("DEDUP_IP_UA_WINDOW_HOURS", "24"))
-
+# Cookie dedup eslashi (kun). 0 = avtomatik tozalash o'chirilgan. clicks saqlanadi.
 TRACK_VISITORS_RETENTION_DAYS = int(os.getenv("TRACK_VISITORS_RETENTION_DAYS", "90"))
 TRACK_VISITORS_CLEANUP_INTERVAL_HOURS = float(
     os.getenv("TRACK_VISITORS_CLEANUP_INTERVAL_HOURS", "24")
@@ -72,6 +71,8 @@ QR_LOGO_RATIO = float(os.getenv("QR_LOGO_RATIO", "0.22"))
 QR_BOX_SIZE = int(os.getenv("QR_BOX_SIZE", "12"))
 QR_BORDER = int(os.getenv("QR_BORDER", "2"))
 
+# Super-admin Telegram ID'lari (faqat env). Bot orqali boshqa super qo'shib bo'lmaydi.
+# Oddiy admin/viewer DB orqali qo'lda qo'shiladi — ADMIN_IDS dan avto-ko'chirilmaydi.
 _raw_admins = os.getenv("ADMIN_IDS", "")
 ADMIN_IDS: set[int] = set()
 for part in _raw_admins.replace(" ", "").split(","):
@@ -79,5 +80,10 @@ for part in _raw_admins.replace(" ", "").split(","):
         ADMIN_IDS.add(int(part))
 
 
-def is_admin(user_id: int) -> bool:
+def is_super_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
+
+
+def is_admin(user_id: int) -> bool:
+    """Orqaga moslik: env super-admin. Yangi kodda is_super_admin / access.* ishlating."""
+    return is_super_admin(user_id)

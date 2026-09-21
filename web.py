@@ -1,4 +1,3 @@
-import hashlib
 import secrets
 
 from aiohttp import web
@@ -6,7 +5,6 @@ from yarl import URL
 
 from security_web import (
     SlidingWindowRateLimiter,
-    get_client_ip,
     is_bot_or_crawler_ua,
     is_valid_track_token,
     rate_limit_middleware,
@@ -16,14 +14,6 @@ VISITOR_COOKIE_NAME = "pb_vid"
 VISITOR_COOKIE_MAX_AGE = 60 * 60 * 24 * 365 * 2  # 2 yil
 
 
-def _ip_ua_hash(request: web.Request) -> str:
-    """Cookie o'chirilgan/incognito holatlar uchun zaxira imzo (IP + User-Agent)."""
-    ip = get_client_ip(request)
-    ua = request.headers.get("User-Agent", "")
-    raw = f"{ip}|{ua}".encode("utf-8", errors="ignore")
-    return hashlib.sha256(raw).hexdigest()
-
-
 async def health(request: web.Request) -> web.StreamResponse:
     """Render health check — /r/ kabi DB yuklamasiz."""
     return web.Response(text="OK")
@@ -31,7 +21,6 @@ async def health(request: web.Request) -> web.StreamResponse:
 
 async def redirect_handler(request: web.Request) -> web.StreamResponse:
     import db
-    from config import DEDUP_IP_UA_WINDOW_HOURS
 
     if not db.is_ready():
         raise web.HTTPServiceUnavailable(
@@ -55,12 +44,7 @@ async def redirect_handler(request: web.Request) -> web.StreamResponse:
         visitor_id = secrets.token_urlsafe(16)
 
     if count_visit and visitor_id:
-        await db.record_visit(
-            token,
-            visitor_id,
-            ip_ua_hash=_ip_ua_hash(request),
-            dedup_window_hours=DEDUP_IP_UA_WINDOW_HOURS,
-        )
+        await db.record_visit(token, visitor_id)
 
     # Lotin bo'lmagan domen/yul uchun to'g'ri kodlangan Location
     response = web.HTTPFound(location=str(URL(target)))

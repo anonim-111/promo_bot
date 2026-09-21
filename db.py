@@ -323,12 +323,6 @@ async def _migrate_track_visitors_link_scope(conn: asyncpg.Connection) -> None:
             END $$;
             """
         )
-        await conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_track_visitors_link_ip_ua
-            ON track_visitors (link_id, ip_ua_hash, first_seen)
-            """
-        )
         try:
             await conn.execute(
                 "ALTER TABLE track_visitors ALTER COLUMN link_id SET NOT NULL"
@@ -358,12 +352,6 @@ async def _migrate_track_visitors_link_scope(conn: asyncpg.Connection) -> None:
         """
         CREATE UNIQUE INDEX IF NOT EXISTS uq_track_visitors_link_visitor
         ON track_visitors (link_id, visitor_id)
-        """
-    )
-    await conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_track_visitors_link_ip_ua
-        ON track_visitors (link_id, ip_ua_hash, first_seen)
         """
     )
     nulls_left = await conn.fetchval(
@@ -457,14 +445,10 @@ async def init_db() -> None:
                 id BIGSERIAL PRIMARY KEY,
                 token TEXT NOT NULL REFERENCES track_entries(token) ON DELETE CASCADE,
                 visitor_id TEXT NOT NULL,
-                ip_ua_hash TEXT,
                 first_seen TIMESTAMPTZ NOT NULL,
                 link_id BIGINT
             );
             """
-        )
-        await conn.execute(
-            "ALTER TABLE track_visitors ADD COLUMN IF NOT EXISTS ip_ua_hash TEXT;"
         )
         await conn.execute(
             """
@@ -476,16 +460,12 @@ async def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_track_visitors_token ON track_visitors(token);"
         )
         await conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_track_visitors_ip_ua
-            ON track_visitors(token, ip_ua_hash, first_seen);
-            """
-        )
-        await conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_track_visitors_first_seen ON track_visitors(first_seen);"
         )
         # Bir link + bir visitor = bitta yozuv (eski token-level unique o'rniga)
         await _migrate_track_visitors_link_scope(conn)
+        # IP+UA dedup olib tashlangan — ustun/indekslar diskni bo'shatadi
+        await _drop_track_visitors_ip_ua(conn)
         await conn.execute(
             "ALTER TABLE links ADD COLUMN IF NOT EXISTS logo_path TEXT;"
         )
@@ -541,6 +521,34 @@ async def init_db() -> None:
             """,
             _now_utc(),
             category_id,
+        )
+        # Bot foydalanuvchilari: admin | viewer (super faqat env ADMIN_IDS)
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bot_users (
+                telegram_id BIGINT PRIMARY KEY,
+                role TEXT NOT NULL CHECK (role IN ('admin', 'viewer')),
+                display_name TEXT,
+                created_at TIMESTAMPTZ NOT NULL
+            );
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bot_user_categories (
+                telegram_id BIGINT NOT NULL
+                    REFERENCES bot_users(telegram_id) ON DELETE CASCADE,
+                category_id BIGINT NOT NULL
+                    REFERENCES promo_group_categories(id) ON DELETE CASCADE,
+                PRIMARY KEY (telegram_id, category_id)
+            );
+            """
+        )
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_bot_user_categories_category
+            ON bot_user_categories(category_id);
+            """
         )
     await sync_category_priorities()
 
@@ -1169,13 +1177,17 @@ async def get_link_url_by_token(token: str) -> str | None:
         return str(value) if value is not None else None
 
 
-async def record_visit(
-    token: str,
-    visitor_id: str,
-    ip_ua_hash: str | None = None,
-    dedup_window_hours: float = 24.0,
-) -> bool:
-    """Bir link ichida bir visitor (cookie / IP+UA) faqat bir marta hisoblanadi.
+async def _drop_track_visitors_ip_ua(conn: asyncpg.Connection) -> None:
+    """Eski IP+UA dedup ustuni va indekslarini olib tashlash (disk tejash)."""
+    await conn.execute("DROP INDEX IF EXISTS idx_track_visitors_ip_ua")
+    await conn.execute("DROP INDEX IF EXISTS idx_track_visitors_link_ip_ua")
+    await conn.execute(
+        "ALTER TABLE track_visitors DROP COLUMN IF EXISTS ip_ua_hash"
+    )
+
+
+async def record_visit(token: str, visitor_id: str) -> bool:
+    """Bir link ichida bir visitor (cookie) faqat bir marta hisoblanadi.
 
     First-touch: birinchi skanlangan promo tokeniga clicks +1.
     Bir xil linkdagi boshqa promo QR lar hisoblanmaydi.
@@ -1193,21 +1205,11 @@ async def record_visit(
             existing = await conn.fetchrow(
                 """
                 SELECT id FROM track_visitors
-                WHERE link_id = $1
-                  AND (
-                    visitor_id = $2
-                    OR (
-                        $3::text IS NOT NULL
-                        AND ip_ua_hash = $3
-                        AND first_seen > NOW() - ($4 * INTERVAL '1 hour')
-                    )
-                  )
+                WHERE link_id = $1 AND visitor_id = $2
                 LIMIT 1
                 """,
                 link_id,
                 visitor_id,
-                ip_ua_hash,
-                dedup_window_hours,
             )
             if existing is not None:
                 return False
@@ -1215,13 +1217,12 @@ async def record_visit(
                 await conn.execute(
                     """
                     INSERT INTO track_visitors
-                        (token, link_id, visitor_id, ip_ua_hash, first_seen)
-                    VALUES ($1, $2, $3, $4, $5)
+                        (token, link_id, visitor_id, first_seen)
+                    VALUES ($1, $2, $3, $4)
                     """,
                     token,
                     link_id,
                     visitor_id,
-                    ip_ua_hash,
                     _now_utc(),
                 )
             except UniqueViolationError:
@@ -1366,3 +1367,157 @@ async def stats_category_totals() -> list[dict[str, Any]]:
             }
             for row in rows
         ]
+
+
+# ── Bot foydalanuvchilari (admin / viewer) ──────────────────────────────────
+
+
+async def get_bot_user(telegram_id: int) -> dict[str, Any] | None:
+    assert _pool is not None
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT telegram_id, role, display_name, created_at
+            FROM bot_users WHERE telegram_id = $1
+            """,
+            telegram_id,
+        )
+        return _row(row) if row else None
+
+
+async def list_bot_users() -> list[dict[str, Any]]:
+    assert _pool is not None
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT telegram_id, role, display_name, created_at
+            FROM bot_users
+            ORDER BY role ASC, telegram_id ASC
+            """
+        )
+        return [_row(row) for row in rows]
+
+
+async def upsert_bot_user(
+    telegram_id: int,
+    role: str,
+    *,
+    display_name: str | None = None,
+) -> None:
+    if role not in ("admin", "viewer"):
+        raise ValueError("role must be admin or viewer")
+    assert _pool is not None
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO bot_users (telegram_id, role, display_name, created_at)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (telegram_id) DO UPDATE SET
+                role = EXCLUDED.role,
+                display_name = COALESCE(EXCLUDED.display_name, bot_users.display_name)
+            """,
+            telegram_id,
+            role,
+            display_name,
+            _now_utc(),
+        )
+        if role != "viewer":
+            await conn.execute(
+                "DELETE FROM bot_user_categories WHERE telegram_id = $1",
+                telegram_id,
+            )
+
+
+async def delete_bot_user(telegram_id: int) -> bool:
+    assert _pool is not None
+    async with _pool.acquire() as conn:
+        status = await conn.execute(
+            "DELETE FROM bot_users WHERE telegram_id = $1",
+            telegram_id,
+        )
+        return not status.endswith("0")
+
+
+async def list_viewer_category_ids(telegram_id: int) -> set[int]:
+    assert _pool is not None
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT category_id FROM bot_user_categories
+            WHERE telegram_id = $1
+            """,
+            telegram_id,
+        )
+        return {int(r["category_id"]) for r in rows}
+
+
+async def list_viewer_categories(telegram_id: int) -> list[dict[str, Any]]:
+    assert _pool is not None
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT c.id, c.name, c.priority, c.created_at
+            FROM bot_user_categories uc
+            JOIN promo_group_categories c ON c.id = uc.category_id
+            WHERE uc.telegram_id = $1
+            ORDER BY c.priority ASC, LOWER(c.name), c.id
+            """,
+            telegram_id,
+        )
+        return [_row(row) for row in rows]
+
+
+async def set_viewer_categories(telegram_id: int, category_ids: set[int]) -> None:
+    """Viewer kategoriyalarini to'liq almashtirish. User viewer bo'lishi shart emas —
+    chaqiruvchi oldin upsert qilgan bo'lishi kerak."""
+    assert _pool is not None
+    ids = sorted({int(cid) for cid in category_ids})
+    async with _pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                "DELETE FROM bot_user_categories WHERE telegram_id = $1",
+                telegram_id,
+            )
+            if ids:
+                await conn.executemany(
+                    """
+                    INSERT INTO bot_user_categories (telegram_id, category_id)
+                    VALUES ($1, $2)
+                    ON CONFLICT DO NOTHING
+                    """,
+                    [(telegram_id, cid) for cid in ids],
+                )
+
+
+async def toggle_viewer_category(telegram_id: int, category_id: int) -> bool:
+    """True = qo'shildi, False = olib tashlandi."""
+    assert _pool is not None
+    async with _pool.acquire() as conn:
+        existing = await conn.fetchval(
+            """
+            SELECT 1 FROM bot_user_categories
+            WHERE telegram_id = $1 AND category_id = $2
+            """,
+            telegram_id,
+            category_id,
+        )
+        if existing:
+            await conn.execute(
+                """
+                DELETE FROM bot_user_categories
+                WHERE telegram_id = $1 AND category_id = $2
+                """,
+                telegram_id,
+                category_id,
+            )
+            return False
+        await conn.execute(
+            """
+            INSERT INTO bot_user_categories (telegram_id, category_id)
+            VALUES ($1, $2)
+            ON CONFLICT DO NOTHING
+            """,
+            telegram_id,
+            category_id,
+        )
+        return True
