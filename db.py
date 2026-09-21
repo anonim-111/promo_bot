@@ -464,7 +464,7 @@ async def init_db() -> None:
         )
         # Bir link + bir visitor = bitta yozuv (eski token-level unique o'rniga)
         await _migrate_track_visitors_link_scope(conn)
-        # IP+UA dedup olib tashlangan — ustun/indekslar diskni bo'shatadi
+        # IP+UA dedup indekslari olinadi; ustun compat uchun qoladi
         await _drop_track_visitors_ip_ua(conn)
         await conn.execute(
             "ALTER TABLE links ADD COLUMN IF NOT EXISTS logo_path TEXT;"
@@ -1178,11 +1178,16 @@ async def get_link_url_by_token(token: str) -> str | None:
 
 
 async def _drop_track_visitors_ip_ua(conn: asyncpg.Connection) -> None:
-    """Eski IP+UA dedup ustuni va indekslarini olib tashlash (disk tejash)."""
+    """IP+UA dedup indekslarini olib tashlash; ustunni saqlab qolamiz.
+
+    Rolling deploy paytida eski jarayon hali ip_ua_hash so'rovi yuborishi mumkin —
+    DROP COLUMN 500 beradi. Yangi kod ustunni yozmaydi/o'qimaydi.
+    """
     await conn.execute("DROP INDEX IF EXISTS idx_track_visitors_ip_ua")
     await conn.execute("DROP INDEX IF EXISTS idx_track_visitors_link_ip_ua")
+    # Agar oldingi deploy ustunni o'chirgan bo'lsa — qayta qo'shamiz (compat).
     await conn.execute(
-        "ALTER TABLE track_visitors DROP COLUMN IF EXISTS ip_ua_hash"
+        "ALTER TABLE track_visitors ADD COLUMN IF NOT EXISTS ip_ua_hash TEXT"
     )
 
 
