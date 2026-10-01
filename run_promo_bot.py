@@ -91,13 +91,15 @@ async def main() -> None:
         )
 
     # ── Avval web port (Render /health), keyin DB, so'ng bot ──
-    # /r/ DB tayyor bo'lguncha 503 qaytaradi (web.redirect_handler).
+    # Proxy yoqilmagan bo'lsa /r/ DB tayyor bo'lguncha 503 qaytaradi.
     app = create_app()
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, WEB_HOST, WEB_PORT)
     await site.start()
     logging.info("Kuzatuv serveri: http://%s:%s/r/<token>", WEB_HOST, WEB_PORT)
+    if app.get("proxy_upstream"):
+        logging.info("/r/ proxy: %s", app["proxy_upstream"])
 
     cleanup_task: asyncio.Task | None = None
     bot = None
