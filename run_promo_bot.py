@@ -13,6 +13,7 @@ from bot import get_dispatcher, make_bot
 from config import (
     ADMIN_IDS,
     BOT_TOKEN,
+    FORWARD_TO,
     TRACK_VISITORS_CLEANUP_INTERVAL_HOURS,
     TRACK_VISITORS_RETENTION_DAYS,
     WEB_HOST,
@@ -91,15 +92,15 @@ async def main() -> None:
         )
 
     # ── Avval web port (Render /health), keyin DB, so'ng bot ──
-    # Proxy yoqilmagan bo'lsa /r/ DB tayyor bo'lguncha 503 qaytaradi.
+    # FORWARD_TO bo'sh bo'lsa /r/ DB tayyor bo'lguncha 503 qaytaradi.
     app = create_app()
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, WEB_HOST, WEB_PORT)
     await site.start()
     logging.info("Kuzatuv serveri: http://%s:%s/r/<token>", WEB_HOST, WEB_PORT)
-    if app.get("proxy_upstream"):
-        logging.info("/r/ proxy: %s", app["proxy_upstream"])
+    if FORWARD_TO:
+        logging.info("/r/ 302: %s/r/<token>", FORWARD_TO)
 
     cleanup_task: asyncio.Task | None = None
     bot = None

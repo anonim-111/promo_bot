@@ -7,8 +7,9 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 BASE_URL = os.getenv("BASE_URL", "http://127.0.0.1:8080").strip().rstrip("/")
-# Bo'sh bo'lsa /r/{token} shu serverda hisoblanadi. To'lsa so'rov shu bazaga proxy qilinadi.
-TRACK_PROXY_URL = os.getenv("TRACK_PROXY_URL", "").strip().rstrip("/")
+# Bo'sh bo'lsa /r/{token} shu serverda hisoblanadi.
+# To'lsa brauzer 302 bilan o'zi shu manzilga o'tadi (server so'rov yubormaydi).
+FORWARD_TO = os.getenv("FORWARD_TO", "").strip().rstrip("/")
 WEB_HOST = os.getenv("WEB_HOST", "0.0.0.0")
 # Render kabi platformalarda PORT avtomatik beriladi.
 WEB_PORT = int(os.getenv("WEB_PORT") or os.getenv("PORT", "8080"))
